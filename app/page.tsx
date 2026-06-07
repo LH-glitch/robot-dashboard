@@ -198,7 +198,6 @@ function formatTickLabel(timeMs: number, unit: TimeUnit): string {
 
   if (unit === "seconds") return `${hh}:${mn}:${ss}`;
   if (unit === "minutes" || unit === "hours") return `${hh}:${mn}`;
-  if (unit === "days") return `${mo} ${dy} ${hh}:${mn}`;
   return `${mo} ${dy}`;
 }
 
@@ -335,10 +334,9 @@ export default function Home() {
 
   const xAxisTickCount = useMemo(() => {
     const n = selectedSeries.length;
-    if (n <= 8) return n;
-    if (timeUnit === "days") return Math.min(n, 7);
-    if (timeUnit === "all") return Math.min(n, 10);
-    return 8;
+    if (n <= 6) return n;
+    if (timeUnit === "seconds" || timeUnit === "minutes" || timeUnit === "hours") return 8;
+    return 7;
   }, [selectedSeries.length, timeUnit]);
 
   const chartStats = useMemo(() => {
