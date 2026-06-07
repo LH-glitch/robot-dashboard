@@ -850,7 +850,17 @@ export default function Home() {
                       />
                       <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
                       <Tooltip
-                        labelFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                        labelFormatter={(label) => {
+                          const timeMs =
+                            typeof label === "number"
+                              ? label
+                              : typeof label === "string"
+                                ? Number(label)
+                                : NaN;
+                          return Number.isFinite(timeMs)
+                            ? formatTickLabel(timeMs, timeUnit)
+                            : String(label ?? "");
+                        }}
                         contentStyle={{
                           backgroundColor: "#020617",
                           border: "1px solid #334155",
@@ -885,7 +895,17 @@ export default function Home() {
                       />
                       <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
                       <Tooltip
-                        labelFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                        labelFormatter={(label) => {
+                          const timeMs =
+                            typeof label === "number"
+                              ? label
+                              : typeof label === "string"
+                                ? Number(label)
+                                : NaN;
+                          return Number.isFinite(timeMs)
+                            ? formatTickLabel(timeMs, timeUnit)
+                            : String(label ?? "");
+                        }}
                         contentStyle={{
                           backgroundColor: "#020617",
                           border: "1px solid #334155",
@@ -920,7 +940,17 @@ export default function Home() {
                       />
                       <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
                       <Tooltip
-                        labelFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                        labelFormatter={(label) => {
+                          const timeMs =
+                            typeof label === "number"
+                              ? label
+                              : typeof label === "string"
+                                ? Number(label)
+                                : NaN;
+                          return Number.isFinite(timeMs)
+                            ? formatTickLabel(timeMs, timeUnit)
+                            : String(label ?? "");
+                        }}
                         contentStyle={{
                           backgroundColor: "#020617",
                           border: "1px solid #334155",
@@ -948,7 +978,17 @@ export default function Home() {
                       <YAxis dataKey="value" tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
                       <Tooltip
                         cursor={{ strokeDasharray: "3 3", stroke: "#64748b" }}
-                        labelFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                        labelFormatter={(label) => {
+                          const timeMs =
+                            typeof label === "number"
+                              ? label
+                              : typeof label === "string"
+                                ? Number(label)
+                                : NaN;
+                          return Number.isFinite(timeMs)
+                            ? formatTickLabel(timeMs, timeUnit)
+                            : String(label ?? "");
+                        }}
                         contentStyle={{
                           backgroundColor: "#020617",
                           border: "1px solid #334155",
@@ -975,7 +1015,17 @@ export default function Home() {
                       />
                       <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
                       <Tooltip
-                        labelFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                        labelFormatter={(label) => {
+                          const timeMs =
+                            typeof label === "number"
+                              ? label
+                              : typeof label === "string"
+                                ? Number(label)
+                                : NaN;
+                          return Number.isFinite(timeMs)
+                            ? formatTickLabel(timeMs, timeUnit)
+                            : String(label ?? "");
+                        }}
                         contentStyle={{
                           backgroundColor: "#020617",
                           border: "1px solid #334155",
