@@ -47,6 +47,7 @@ type SuddenJump = {
 type ChartType = "line" | "area" | "bar" | "scatter" | "step";
 type TimeUnit = "seconds" | "minutes" | "hours" | "days" | "all";
 type BehaviorScore = "Stable" | "Cautious" | "Warning" | "Critical";
+type DataSource = "demo" | "local" | null;
 
 function parseMaybeNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -184,21 +185,61 @@ function calculateSuddenJumps(records: Array<SensorRecord & { value: number }>):
 
 export default function Home() {
   const [records, setRecords] = useState<SensorRecord[]>([]);
+  const [dataSource, setDataSource] = useState<DataSource>(null);
+  const [dataLoadMessage, setDataLoadMessage] = useState<string | null>(null);
   const [selectedSensor, setSelectedSensor] = useState<string>("distance");
   const [selectedChartType, setSelectedChartType] = useState<ChartType>("line");
   const [timeAmount, setTimeAmount] = useState<string>("10");
   const [timeUnit, setTimeUnit] = useState<TimeUnit>("minutes");
 
   useEffect(() => {
-    fetch("/data/all-connections.json")
-      .then((res) => res.json())
-      .then((data) => {
-        const extracted = extractMessagesRecursively(data);
-        setRecords(extracted);
-      })
-      .catch(() => {
+    let isCancelled = false;
+
+    const fetchJson = async (path: string): Promise<unknown> => {
+      const response = await fetch(path, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`Failed to load ${path} (${response.status})`);
+      }
+      return response.json();
+    };
+
+    const loadTelemetry = async () => {
+      try {
+        const demoData = await fetchJson("/data/demo-connections.json");
+        if (isCancelled) return;
+
+        setRecords(extractMessagesRecursively(demoData));
+        setDataSource("demo");
+        setDataLoadMessage(null);
+        return;
+      } catch (demoError) {
+        console.warn("Demo telemetry file unavailable:", demoError);
+      }
+
+      try {
+        const localData = await fetchJson("/data/all-connections.json");
+        if (isCancelled) return;
+
+        setRecords(extractMessagesRecursively(localData));
+        setDataSource("local");
+        setDataLoadMessage(null);
+      } catch (localError) {
+        console.error("Telemetry files unavailable:", localError);
+        if (isCancelled) return;
+
         setRecords([]);
-      });
+        setDataSource(null);
+        setDataLoadMessage(
+          "No telemetry data file found. Add public/data/all-connections.json locally or provide a sanitized demo file.",
+        );
+      }
+    };
+
+    void loadTelemetry();
+
+    return () => {
+      isCancelled = true;
+    };
   }, []);
 
   const sensorOptions = useMemo(() => {
@@ -530,6 +571,18 @@ export default function Home() {
           <p className="mt-2 text-sm text-slate-400 sm:text-base">
             Real-time and historical analysis of robot sensor data
           </p>
+
+          {dataLoadMessage && (
+            <div className="mt-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
+              {dataLoadMessage}
+            </div>
+          )}
+
+          {dataSource === "demo" && !dataLoadMessage && (
+            <div className="mt-4 rounded-lg border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-sm text-sky-100">
+              Showing sanitized demo telemetry data.
+            </div>
+          )}
 
           <div className="mt-4 grid gap-2 text-xs sm:grid-cols-3">
             <div className="rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2">

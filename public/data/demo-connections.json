@@ -1,0 +1,92 @@
+[
+  {
+    "id": "message-demo-temperature-1",
+    "createAt": "2026-06-07 10:00:00:000",
+    "topic": "braude/team1/temperature",
+    "payload": "24.6"
+  },
+  {
+    "id": "message-demo-humidity-1",
+    "createAt": "2026-06-07 10:00:05:000",
+    "topic": "braude/team1/humidity",
+    "payload": "48.2"
+  },
+  {
+    "id": "message-demo-pressure-1",
+    "createAt": "2026-06-07 10:00:10:000",
+    "topic": "braude/team1/pressure",
+    "payload": "1012.4"
+  },
+  {
+    "id": "message-demo-distance-1",
+    "createAt": "2026-06-07 10:00:15:000",
+    "topic": "braude/team1/distance",
+    "payload": "86.9"
+  },
+  {
+    "id": "message-demo-accel-1",
+    "createAt": "2026-06-07 10:00:20:000",
+    "topic": "braude/team1/accel",
+    "payload": "0.14"
+  },
+  {
+    "id": "message-demo-temperature-2",
+    "createAt": "2026-06-07 10:00:25:000",
+    "topic": "braude/team1/temperature",
+    "payload": "24.9"
+  },
+  {
+    "id": "message-demo-humidity-2",
+    "createAt": "2026-06-07 10:00:30:000",
+    "topic": "braude/team1/humidity",
+    "payload": "49.0"
+  },
+  {
+    "id": "message-demo-pressure-2",
+    "createAt": "2026-06-07 10:00:35:000",
+    "topic": "braude/team1/pressure",
+    "payload": "1012.1"
+  },
+  {
+    "id": "message-demo-distance-2",
+    "createAt": "2026-06-07 10:00:40:000",
+    "topic": "braude/team1/distance",
+    "payload": "84.7"
+  },
+  {
+    "id": "message-demo-accel-2",
+    "createAt": "2026-06-07 10:00:45:000",
+    "topic": "braude/team1/accel",
+    "payload": "0.20"
+  },
+  {
+    "id": "message-demo-temperature-3",
+    "createAt": "2026-06-07 10:00:50:000",
+    "topic": "braude/team1/temperature",
+    "payload": "25.1"
+  },
+  {
+    "id": "message-demo-humidity-3",
+    "createAt": "2026-06-07 10:00:55:000",
+    "topic": "braude/team1/humidity",
+    "payload": "50.1"
+  },
+  {
+    "id": "message-demo-pressure-3",
+    "createAt": "2026-06-07 10:01:00:000",
+    "topic": "braude/team1/pressure",
+    "payload": "1011.8"
+  },
+  {
+    "id": "message-demo-distance-3",
+    "createAt": "2026-06-07 10:01:05:000",
+    "topic": "braude/team1/distance",
+    "payload": "82.6"
+  },
+  {
+    "id": "message-demo-accel-3",
+    "createAt": "2026-06-07 10:01:10:000",
+    "topic": "braude/team1/accel",
+    "payload": "0.18"
+  }
+]
