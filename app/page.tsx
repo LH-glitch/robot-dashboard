@@ -183,6 +183,25 @@ function calculateSuddenJumps(records: Array<SensorRecord & { value: number }>):
   return jumps.sort((a, b) => b.percentageJump - a.percentageJump);
 }
 
+const MONTH_NAMES = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+] as const;
+
+function formatTickLabel(timeMs: number, unit: TimeUnit): string {
+  const d = new Date(timeMs);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mn = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  const dy = String(d.getDate()).padStart(2, "0");
+  const mo = MONTH_NAMES[d.getMonth()];
+
+  if (unit === "seconds") return `${hh}:${mn}:${ss}`;
+  if (unit === "minutes" || unit === "hours") return `${hh}:${mn}`;
+  if (unit === "days") return `${mo} ${dy} ${hh}:${mn}`;
+  return `${mo} ${dy}`;
+}
+
 export default function Home() {
   const [records, setRecords] = useState<SensorRecord[]>([]);
   const [dataSource, setDataSource] = useState<DataSource>(null);
@@ -283,21 +302,19 @@ export default function Home() {
   const selectedSeries = useMemo(() => {
     const baseRecords = selectedSensorNumericRecords;
 
+    const toPoint = (r: SensorRecord & { value: number }) => ({
+      timeMs: r.timeMs,
+      value: r.value,
+      topic: r.topic,
+    });
+
     if (baseRecords.length === 0 || timeUnit === "all") {
-      return baseRecords.map((r) => ({
-        timeLabel: new Date(r.timeMs || Date.now()).toLocaleTimeString(),
-        value: r.value,
-        topic: r.topic,
-      }));
+      return baseRecords.map(toPoint);
     }
 
     const amount = Number(timeAmount);
     if (!Number.isFinite(amount) || amount <= 0) {
-      return baseRecords.map((r) => ({
-        timeLabel: new Date(r.timeMs || Date.now()).toLocaleTimeString(),
-        value: r.value,
-        topic: r.topic,
-      }));
+      return baseRecords.map(toPoint);
     }
 
     const multiplierByUnit: Record<Exclude<TimeUnit, "all">, number> = {
@@ -313,12 +330,16 @@ export default function Home() {
 
     return baseRecords
       .filter((r) => r.timeMs >= cutoff)
-      .map((r) => ({
-        timeLabel: new Date(r.timeMs || Date.now()).toLocaleTimeString(),
-        value: r.value,
-        topic: r.topic,
-      }));
+      .map(toPoint);
   }, [selectedSensorNumericRecords, timeAmount, timeUnit]);
+
+  const xAxisTickCount = useMemo(() => {
+    const n = selectedSeries.length;
+    if (n <= 8) return n;
+    if (timeUnit === "days") return Math.min(n, 7);
+    if (timeUnit === "all") return Math.min(n, 10);
+    return 8;
+  }, [selectedSeries.length, timeUnit]);
 
   const chartStats = useMemo(() => {
     if (selectedSeries.length === 0) {
@@ -804,14 +825,34 @@ export default function Home() {
                 </div>
               </div>
 
+              <div className="mb-3 rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-1.5 font-mono text-[11px] text-slate-400">
+                Sensor = {selectedSensor}&nbsp;&nbsp;|&nbsp;&nbsp;Points = {selectedSeries.length}&nbsp;&nbsp;|&nbsp;&nbsp;Time Range = {timeUnit === "all" ? "all" : `${timeAmount} ${timeUnit}`}
+                {selectedSeries.length > 0 && (
+                  <>
+                    &nbsp;&nbsp;|&nbsp;&nbsp;First Point = {formatTickLabel(selectedSeries[0].timeMs, "days")}
+                    &nbsp;&nbsp;|&nbsp;&nbsp;Last Point = {formatTickLabel(selectedSeries[selectedSeries.length - 1].timeMs, "days")}
+                  </>
+                )}
+              </div>
+
               <div className="h-80 w-full">
                 <ResponsiveContainer width="100%" height="100%">
                   {selectedChartType === "line" && (
                     <LineChart data={selectedSeries}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                      <XAxis dataKey="timeLabel" tick={{ fill: "#94a3b8", fontSize: 11 }} minTickGap={24} />
+                      <XAxis
+                        dataKey="timeMs"
+                        type="number"
+                        scale="time"
+                        domain={["dataMin", "dataMax"]}
+                        tickCount={xAxisTickCount}
+                        tickFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                        tick={{ fill: "#94a3b8", fontSize: 11 }}
+                        minTickGap={40}
+                      />
                       <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
                       <Tooltip
+                        labelFormatter={(v: number) => formatTickLabel(v, timeUnit)}
                         contentStyle={{
                           backgroundColor: "#020617",
                           border: "1px solid #334155",
@@ -834,9 +875,19 @@ export default function Home() {
                   {selectedChartType === "area" && (
                     <AreaChart data={selectedSeries}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                      <XAxis dataKey="timeLabel" tick={{ fill: "#94a3b8", fontSize: 11 }} minTickGap={24} />
+                      <XAxis
+                        dataKey="timeMs"
+                        type="number"
+                        scale="time"
+                        domain={["dataMin", "dataMax"]}
+                        tickCount={xAxisTickCount}
+                        tickFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                        tick={{ fill: "#94a3b8", fontSize: 11 }}
+                        minTickGap={40}
+                      />
                       <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
                       <Tooltip
+                        labelFormatter={(v: number) => formatTickLabel(v, timeUnit)}
                         contentStyle={{
                           backgroundColor: "#020617",
                           border: "1px solid #334155",
@@ -859,9 +910,19 @@ export default function Home() {
                   {selectedChartType === "bar" && (
                     <BarChart data={selectedSeries}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                      <XAxis dataKey="timeLabel" tick={{ fill: "#94a3b8", fontSize: 11 }} minTickGap={24} />
+                      <XAxis
+                        dataKey="timeMs"
+                        type="number"
+                        scale="time"
+                        domain={["dataMin", "dataMax"]}
+                        tickCount={xAxisTickCount}
+                        tickFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                        tick={{ fill: "#94a3b8", fontSize: 11 }}
+                        minTickGap={40}
+                      />
                       <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
                       <Tooltip
+                        labelFormatter={(v: number) => formatTickLabel(v, timeUnit)}
                         contentStyle={{
                           backgroundColor: "#020617",
                           border: "1px solid #334155",
@@ -876,10 +937,20 @@ export default function Home() {
                   {selectedChartType === "scatter" && (
                     <ScatterChart data={selectedSeries}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                      <XAxis dataKey="timeLabel" tick={{ fill: "#94a3b8", fontSize: 11 }} minTickGap={24} />
+                      <XAxis
+                        dataKey="timeMs"
+                        type="number"
+                        scale="time"
+                        domain={["dataMin", "dataMax"]}
+                        tickCount={xAxisTickCount}
+                        tickFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                        tick={{ fill: "#94a3b8", fontSize: 11 }}
+                        minTickGap={40}
+                      />
                       <YAxis dataKey="value" tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
                       <Tooltip
                         cursor={{ strokeDasharray: "3 3", stroke: "#64748b" }}
+                        labelFormatter={(v: number) => formatTickLabel(v, timeUnit)}
                         contentStyle={{
                           backgroundColor: "#020617",
                           border: "1px solid #334155",
@@ -894,9 +965,19 @@ export default function Home() {
                   {selectedChartType === "step" && (
                     <LineChart data={selectedSeries}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                      <XAxis dataKey="timeLabel" tick={{ fill: "#94a3b8", fontSize: 11 }} minTickGap={24} />
+                      <XAxis
+                        dataKey="timeMs"
+                        type="number"
+                        scale="time"
+                        domain={["dataMin", "dataMax"]}
+                        tickCount={xAxisTickCount}
+                        tickFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                        tick={{ fill: "#94a3b8", fontSize: 11 }}
+                        minTickGap={40}
+                      />
                       <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
                       <Tooltip
+                        labelFormatter={(v: number) => formatTickLabel(v, timeUnit)}
                         contentStyle={{
                           backgroundColor: "#020617",
                           border: "1px solid #334155",
