@@ -62,6 +62,13 @@ type ComparisonSensorDefinition = {
   dasharray?: string;
 };
 
+type CorrelationPairSummary = {
+  left: ComparisonSensorKey;
+  right: ComparisonSensorKey;
+  coefficient: number;
+  sampleCount: number;
+};
+
 function parseMaybeNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -252,6 +259,36 @@ function formatTickLabel(timeMs: number, unit: TimeUnit): string {
   if (unit === "seconds") return `${hh}:${mn}:${ss}`;
   if (unit === "minutes" || unit === "hours") return `${hh}:${mn}`;
   return `${mo} ${dy}`;
+}
+
+function calculatePearsonCoefficient(seriesX: number[], seriesY: number[]): number | null {
+  if (seriesX.length !== seriesY.length || seriesX.length < 2) {
+    return null;
+  }
+
+  const n = seriesX.length;
+  const meanX = seriesX.reduce((sum, value) => sum + value, 0) / n;
+  const meanY = seriesY.reduce((sum, value) => sum + value, 0) / n;
+
+  let numerator = 0;
+  let varianceX = 0;
+  let varianceY = 0;
+
+  for (let i = 0; i < n; i += 1) {
+    const deltaX = seriesX[i] - meanX;
+    const deltaY = seriesY[i] - meanY;
+    numerator += deltaX * deltaY;
+    varianceX += deltaX * deltaX;
+    varianceY += deltaY * deltaY;
+  }
+
+  const denominator = Math.sqrt(varianceX * varianceY);
+  if (denominator === 0) {
+    return null;
+  }
+
+  const coefficient = numerator / denominator;
+  return Number.isFinite(coefficient) ? Math.max(-1, Math.min(1, coefficient)) : null;
 }
 
 export default function Home() {
@@ -528,6 +565,182 @@ export default function Home() {
     return 7;
   }, [comparisonChartData.length, timeUnit]);
 
+  const correlationSensorLabelByKey = useMemo(() => {
+    const entries = COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => [
+      sensorDef.key,
+      sensorDef.label.split(" (")[0],
+    ]);
+
+    return Object.fromEntries(entries) as Record<ComparisonSensorKey, string>;
+  }, []);
+
+  const correlationAnalysis = useMemo(() => {
+    const pointsByTime = new Map<number, ComparisonPoint>();
+
+    for (const record of windowedNumericRecords) {
+      const sensorDef = COMPARISON_SENSOR_DEFINITIONS.find((definition) =>
+        definition.aliases.includes(record.sensor),
+      );
+
+      if (!sensorDef) {
+        continue;
+      }
+
+      const existingPoint = pointsByTime.get(record.timeMs) ?? { timeMs: record.timeMs };
+      existingPoint[sensorDef.key] = record.value;
+      pointsByTime.set(record.timeMs, existingPoint);
+    }
+
+    const orderedPoints = Array.from(pointsByTime.values()).sort((a, b) => a.timeMs - b.timeMs);
+    const keys = COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => sensorDef.key);
+
+    const sensorValueCount = keys.reduce<Record<ComparisonSensorKey, number>>(
+      (acc, key) => {
+        acc[key] = orderedPoints.reduce(
+          (count, point) => (typeof point[key] === "number" ? count + 1 : count),
+          0,
+        );
+        return acc;
+      },
+      {
+        temperature: 0,
+        humidity: 0,
+        pressure: 0,
+        distance: 0,
+        accel: 0,
+      },
+    );
+
+    const coefficientMatrix = keys.reduce<Record<ComparisonSensorKey, Record<ComparisonSensorKey, number | null>>>(
+      (acc, rowKey) => {
+        acc[rowKey] = {
+          temperature: null,
+          humidity: null,
+          pressure: null,
+          distance: null,
+          accel: null,
+        };
+        return acc;
+      },
+      {
+        temperature: { temperature: null, humidity: null, pressure: null, distance: null, accel: null },
+        humidity: { temperature: null, humidity: null, pressure: null, distance: null, accel: null },
+        pressure: { temperature: null, humidity: null, pressure: null, distance: null, accel: null },
+        distance: { temperature: null, humidity: null, pressure: null, distance: null, accel: null },
+        accel: { temperature: null, humidity: null, pressure: null, distance: null, accel: null },
+      },
+    );
+
+    const sampleMatrix = keys.reduce<Record<ComparisonSensorKey, Record<ComparisonSensorKey, number>>>(
+      (acc, rowKey) => {
+        acc[rowKey] = {
+          temperature: 0,
+          humidity: 0,
+          pressure: 0,
+          distance: 0,
+          accel: 0,
+        };
+        return acc;
+      },
+      {
+        temperature: { temperature: 0, humidity: 0, pressure: 0, distance: 0, accel: 0 },
+        humidity: { temperature: 0, humidity: 0, pressure: 0, distance: 0, accel: 0 },
+        pressure: { temperature: 0, humidity: 0, pressure: 0, distance: 0, accel: 0 },
+        distance: { temperature: 0, humidity: 0, pressure: 0, distance: 0, accel: 0 },
+        accel: { temperature: 0, humidity: 0, pressure: 0, distance: 0, accel: 0 },
+      },
+    );
+
+    const pairSummaries: CorrelationPairSummary[] = [];
+
+    for (let i = 0; i < keys.length; i += 1) {
+      for (let j = i; j < keys.length; j += 1) {
+        const left = keys[i];
+        const right = keys[j];
+
+        if (left === right) {
+          const diagonalSamples = sensorValueCount[left];
+          coefficientMatrix[left][right] = diagonalSamples >= 2 ? 1 : null;
+          sampleMatrix[left][right] = diagonalSamples;
+          continue;
+        }
+
+        const pairedLeft: number[] = [];
+        const pairedRight: number[] = [];
+
+        for (const point of orderedPoints) {
+          const leftValue = point[left];
+          const rightValue = point[right];
+
+          if (typeof leftValue === "number" && typeof rightValue === "number") {
+            pairedLeft.push(leftValue);
+            pairedRight.push(rightValue);
+          }
+        }
+
+        const coefficient = calculatePearsonCoefficient(pairedLeft, pairedRight);
+        const sampleCount = pairedLeft.length;
+
+        coefficientMatrix[left][right] = coefficient;
+        coefficientMatrix[right][left] = coefficient;
+        sampleMatrix[left][right] = sampleCount;
+        sampleMatrix[right][left] = sampleCount;
+
+        if (coefficient !== null) {
+          pairSummaries.push({
+            left,
+            right,
+            coefficient,
+            sampleCount,
+          });
+        }
+      }
+    }
+
+    const strongestPositivePair =
+      [...pairSummaries]
+        .filter((pair) => pair.coefficient > 0)
+        .sort((a, b) => b.coefficient - a.coefficient)[0] ?? null;
+
+    const strongestNegativePair =
+      [...pairSummaries]
+        .filter((pair) => pair.coefficient < 0)
+        .sort((a, b) => a.coefficient - b.coefficient)[0] ?? null;
+
+    const interpretationRows = [...pairSummaries].sort(
+      (a, b) => Math.abs(b.coefficient) - Math.abs(a.coefficient),
+    );
+
+    const interpretations = interpretationRows.slice(0, 6).map((pair) => {
+      const leftLabel = correlationSensorLabelByKey[pair.left];
+      const rightLabel = correlationSensorLabelByKey[pair.right];
+      const absCoefficient = Math.abs(pair.coefficient);
+
+      if (absCoefficient < 0.15) {
+        return `${leftLabel} and ${rightLabel} appear independent in the current window.`;
+      }
+
+      const strength =
+        absCoefficient >= 0.7
+          ? "strongly"
+          : absCoefficient >= 0.4
+            ? "moderately"
+            : "weakly";
+
+      const direction = pair.coefficient > 0 ? "positively" : "negatively";
+      return `${leftLabel} and ${rightLabel} are ${strength} ${direction} correlated.`;
+    });
+
+    return {
+      keys,
+      coefficientMatrix,
+      sampleMatrix,
+      strongestPositivePair,
+      strongestNegativePair,
+      interpretations,
+    };
+  }, [correlationSensorLabelByKey, windowedNumericRecords]);
+
   const toggleComparisonSensor = (sensorKey: ComparisonSensorKey) => {
     setSelectedComparisonSensors((previous) => {
       if (previous.includes(sensorKey)) {
@@ -800,6 +1013,34 @@ export default function Home() {
         </div>
       </div>
     );
+  };
+
+  const getCorrelationCellClassName = (coefficient: number | null): string => {
+    if (coefficient === null) {
+      return "bg-slate-950/70 text-slate-500";
+    }
+
+    if (coefficient >= 0.7) {
+      return "bg-emerald-500/20 text-emerald-200";
+    }
+
+    if (coefficient <= -0.7) {
+      return "bg-red-500/20 text-red-200";
+    }
+
+    if (Math.abs(coefficient) <= 0.2) {
+      return "bg-slate-700/50 text-slate-200";
+    }
+
+    return coefficient > 0 ? "bg-emerald-500/10 text-emerald-100" : "bg-red-500/10 text-red-100";
+  };
+
+  const formatCorrelationPair = (pair: CorrelationPairSummary | null): string => {
+    if (!pair) {
+      return "No statistically valid pair in current time window.";
+    }
+
+    return `${correlationSensorLabelByKey[pair.left]} and ${correlationSensorLabelByKey[pair.right]} (${pair.coefficient.toFixed(2)}, n=${pair.sampleCount})`;
   };
 
   return (
@@ -1438,6 +1679,120 @@ export default function Home() {
               <p className="mt-3 rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-[11px] text-slate-500">
                 Sensors without numeric observations in the selected dataset are shown but unavailable.
               </p>
+            </aside>
+          </div>
+        </section>
+
+        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+          <div className="mb-4">
+            <h2 className="text-lg font-semibold text-slate-100">Sensor Correlation Analysis</h2>
+            <p className="text-xs text-slate-500">
+              Pearson correlation matrix computed from the active time window across numeric sensors
+            </p>
+            <p className="mt-1 text-[11px] text-slate-500">
+              Coefficient reference: +1 strong positive relationship, 0 no linear relationship, -1 strong negative relationship.
+            </p>
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-3">
+            <article className="rounded-xl border border-slate-800 bg-slate-950/50 p-4 lg:col-span-2">
+              <div className="mb-3 rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-1.5 font-mono text-[11px] text-slate-400">
+                Time Range = {timeUnit === "all" ? "all" : `${timeAmount} ${timeUnit}`}&nbsp;&nbsp;|&nbsp;&nbsp;Window Points = {windowedNumericRecords.length}
+              </div>
+
+              <div className="overflow-x-auto rounded-xl border border-slate-800">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-slate-950/80 text-left text-slate-400">
+                    <tr className="border-b border-slate-800">
+                      <th className="px-3 py-2 font-medium">Sensor</th>
+                      {correlationAnalysis.keys.map((columnKey) => (
+                        <th key={columnKey} className="px-3 py-2 text-center font-medium">
+                          {correlationSensorLabelByKey[columnKey]}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {correlationAnalysis.keys.map((rowKey) => (
+                      <tr key={rowKey} className="border-b border-slate-800/70">
+                        <td className="whitespace-nowrap px-3 py-2 font-medium text-slate-200">
+                          {correlationSensorLabelByKey[rowKey]}
+                        </td>
+                        {correlationAnalysis.keys.map((columnKey) => {
+                          const coefficient = correlationAnalysis.coefficientMatrix[rowKey][columnKey];
+                          const sampleCount = correlationAnalysis.sampleMatrix[rowKey][columnKey];
+
+                          return (
+                            <td key={`${rowKey}-${columnKey}`} className="px-2 py-2">
+                              <div
+                                className={`rounded-md border border-slate-800 px-2 py-1 text-center text-xs font-medium ${getCorrelationCellClassName(coefficient)}`}
+                              >
+                                <p className="font-semibold">
+                                  {coefficient === null ? "N/A" : coefficient.toFixed(2)}
+                                </p>
+                                <p className="text-[10px] opacity-80">n={sampleCount}</p>
+                              </div>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+                <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-emerald-200">
+                  strong positive
+                </span>
+                <span className="rounded-full border border-slate-500/40 bg-slate-700/40 px-2 py-0.5 text-slate-200">
+                  near zero
+                </span>
+                <span className="rounded-full border border-red-500/40 bg-red-500/15 px-2 py-0.5 text-red-200">
+                  strong negative
+                </span>
+              </div>
+            </article>
+
+            <aside className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+              <h3 className="text-base font-medium text-slate-200">Interpretation Panel</h3>
+              <p className="mt-1 text-xs text-slate-500">
+                Relationship summaries derived from coefficient magnitude and direction
+              </p>
+
+              <div className="mt-3 space-y-2">
+                <div className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
+                  <p className="text-[11px] uppercase tracking-wide text-slate-500">Strongest Positive Pair</p>
+                  <p className="mt-1 text-sm text-slate-200">
+                    {formatCorrelationPair(correlationAnalysis.strongestPositivePair)}
+                  </p>
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
+                  <p className="text-[11px] uppercase tracking-wide text-slate-500">Strongest Negative Pair</p>
+                  <p className="mt-1 text-sm text-slate-200">
+                    {formatCorrelationPair(correlationAnalysis.strongestNegativePair)}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-3 rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
+                <p className="mb-2 text-[11px] uppercase tracking-wide text-slate-500">Interpretations</p>
+                {correlationAnalysis.interpretations.length === 0 ? (
+                  <p className="text-sm text-slate-500">
+                    Not enough paired samples to infer sensor relationships in this time window.
+                  </p>
+                ) : (
+                  <ul className="space-y-1.5 text-sm text-slate-300">
+                    {correlationAnalysis.interpretations.map((text, index) => (
+                      <li key={`${text}-${index}`} className="flex items-start gap-2">
+                        <span className="mt-1 h-1.5 w-1.5 rounded-full bg-slate-400" />
+                        <span>{text}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
             </aside>
           </div>
         </section>
