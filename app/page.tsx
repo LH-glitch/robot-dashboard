@@ -69,6 +69,26 @@ type CorrelationPairSummary = {
   sampleCount: number;
 };
 
+type TimeValuePoint = {
+  timeMs: number;
+  value: number;
+};
+
+type CorrelationSensorDebug = {
+  key: ComparisonSensorKey;
+  totalSamples: number;
+  firstTimestampMs: number | null;
+  lastTimestampMs: number | null;
+};
+
+type CorrelationPairDebug = {
+  left: ComparisonSensorKey;
+  right: ComparisonSensorKey;
+  pairedSampleCount: number;
+  averageAlignmentDeltaSeconds: number | null;
+  maximumAlignmentDeltaSeconds: number | null;
+};
+
 function parseMaybeNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -289,6 +309,64 @@ function calculatePearsonCoefficient(seriesX: number[], seriesY: number[]): numb
 
   const coefficient = numerator / denominator;
   return Number.isFinite(coefficient) ? Math.max(-1, Math.min(1, coefficient)) : null;
+}
+
+function lowerBoundByTime(points: TimeValuePoint[], targetTimeMs: number): number {
+  let left = 0;
+  let right = points.length;
+
+  while (left < right) {
+    const mid = Math.floor((left + right) / 2);
+    if (points[mid].timeMs < targetTimeMs) {
+      left = mid + 1;
+    } else {
+      right = mid;
+    }
+  }
+
+  return left;
+}
+
+function alignByNearestNeighbor(
+  sourceSeries: TimeValuePoint[],
+  targetSeries: TimeValuePoint[],
+  maxTimeDeltaMs: number,
+): { alignedSource: number[]; alignedTarget: number[]; deltasMs: number[] } {
+  if (sourceSeries.length === 0 || targetSeries.length === 0) {
+    return { alignedSource: [], alignedTarget: [], deltasMs: [] };
+  }
+
+  const alignedSource: number[] = [];
+  const alignedTarget: number[] = [];
+  const deltasMs: number[] = [];
+
+  for (const sourcePoint of sourceSeries) {
+    const insertIndex = lowerBoundByTime(targetSeries, sourcePoint.timeMs);
+    const candidateIndices = [insertIndex - 1, insertIndex];
+
+    let bestTargetIndex = -1;
+    let bestDelta = Number.POSITIVE_INFINITY;
+
+    for (const candidateIndex of candidateIndices) {
+      if (candidateIndex < 0 || candidateIndex >= targetSeries.length) {
+        continue;
+      }
+
+      const delta = Math.abs(targetSeries[candidateIndex].timeMs - sourcePoint.timeMs);
+      if (delta <= maxTimeDeltaMs && delta < bestDelta) {
+        bestDelta = delta;
+        bestTargetIndex = candidateIndex;
+      }
+    }
+
+    if (bestTargetIndex !== -1) {
+      alignedSource.push(sourcePoint.value);
+      alignedTarget.push(targetSeries[bestTargetIndex].value);
+      deltasMs.push(bestDelta);
+    }
+  }
+
+  return { alignedSource, alignedTarget, deltasMs };
 }
 
 export default function Home() {
@@ -575,7 +653,23 @@ export default function Home() {
   }, []);
 
   const correlationAnalysis = useMemo(() => {
-    const pointsByTime = new Map<number, ComparisonPoint>();
+    const MAX_ALIGNMENT_DELTA_MS = 60 * 1000;
+    const MIN_PAIRED_SAMPLES = 5;
+    const keys = COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => sensorDef.key);
+
+    const seriesBySensor = keys.reduce<Record<ComparisonSensorKey, TimeValuePoint[]>>(
+      (acc, key) => {
+        acc[key] = [];
+        return acc;
+      },
+      {
+        temperature: [],
+        humidity: [],
+        pressure: [],
+        distance: [],
+        accel: [],
+      },
+    );
 
     for (const record of windowedNumericRecords) {
       const sensorDef = COMPARISON_SENSOR_DEFINITIONS.find((definition) =>
@@ -586,30 +680,15 @@ export default function Home() {
         continue;
       }
 
-      const existingPoint = pointsByTime.get(record.timeMs) ?? { timeMs: record.timeMs };
-      existingPoint[sensorDef.key] = record.value;
-      pointsByTime.set(record.timeMs, existingPoint);
+      seriesBySensor[sensorDef.key].push({
+        timeMs: record.timeMs,
+        value: record.value,
+      });
     }
 
-    const orderedPoints = Array.from(pointsByTime.values()).sort((a, b) => a.timeMs - b.timeMs);
-    const keys = COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => sensorDef.key);
-
-    const sensorValueCount = keys.reduce<Record<ComparisonSensorKey, number>>(
-      (acc, key) => {
-        acc[key] = orderedPoints.reduce(
-          (count, point) => (typeof point[key] === "number" ? count + 1 : count),
-          0,
-        );
-        return acc;
-      },
-      {
-        temperature: 0,
-        humidity: 0,
-        pressure: 0,
-        distance: 0,
-        accel: 0,
-      },
-    );
+    for (const key of keys) {
+      seriesBySensor[key].sort((a, b) => a.timeMs - b.timeMs);
+    }
 
     const coefficientMatrix = keys.reduce<Record<ComparisonSensorKey, Record<ComparisonSensorKey, number | null>>>(
       (acc, rowKey) => {
@@ -651,40 +730,65 @@ export default function Home() {
       },
     );
 
+    const sensorDebugRows: CorrelationSensorDebug[] = keys.map((key) => {
+      const series = seriesBySensor[key];
+      return {
+        key,
+        totalSamples: series.length,
+        firstTimestampMs: series[0]?.timeMs ?? null,
+        lastTimestampMs: series[series.length - 1]?.timeMs ?? null,
+      };
+    });
+
+    const pairDebugRows: CorrelationPairDebug[] = [];
     const pairSummaries: CorrelationPairSummary[] = [];
 
     for (let i = 0; i < keys.length; i += 1) {
       for (let j = i; j < keys.length; j += 1) {
         const left = keys[i];
         const right = keys[j];
+        const leftSeries = seriesBySensor[left];
+        const rightSeries = seriesBySensor[right];
 
         if (left === right) {
-          const diagonalSamples = sensorValueCount[left];
-          coefficientMatrix[left][right] = diagonalSamples >= 2 ? 1 : null;
+          const diagonalSamples = leftSeries.length;
+          coefficientMatrix[left][right] = diagonalSamples >= MIN_PAIRED_SAMPLES ? 1 : null;
           sampleMatrix[left][right] = diagonalSamples;
           continue;
         }
 
-        const pairedLeft: number[] = [];
-        const pairedRight: number[] = [];
+        const useLeftAsSource = leftSeries.length <= rightSeries.length;
+        const sourceSeries = useLeftAsSource ? leftSeries : rightSeries;
+        const targetSeries = useLeftAsSource ? rightSeries : leftSeries;
 
-        for (const point of orderedPoints) {
-          const leftValue = point[left];
-          const rightValue = point[right];
+        const aligned = alignByNearestNeighbor(sourceSeries, targetSeries, MAX_ALIGNMENT_DELTA_MS);
+        const sampleCount = aligned.alignedSource.length;
+        const coefficient =
+          sampleCount >= MIN_PAIRED_SAMPLES
+            ? calculatePearsonCoefficient(aligned.alignedSource, aligned.alignedTarget)
+            : null;
 
-          if (typeof leftValue === "number" && typeof rightValue === "number") {
-            pairedLeft.push(leftValue);
-            pairedRight.push(rightValue);
-          }
-        }
-
-        const coefficient = calculatePearsonCoefficient(pairedLeft, pairedRight);
-        const sampleCount = pairedLeft.length;
+        const averageDeltaMs =
+          aligned.deltasMs.length > 0
+            ? aligned.deltasMs.reduce((sum, delta) => sum + delta, 0) / aligned.deltasMs.length
+            : null;
+        const maximumDeltaMs =
+          aligned.deltasMs.length > 0 ? Math.max(...aligned.deltasMs) : null;
 
         coefficientMatrix[left][right] = coefficient;
         coefficientMatrix[right][left] = coefficient;
         sampleMatrix[left][right] = sampleCount;
         sampleMatrix[right][left] = sampleCount;
+
+        pairDebugRows.push({
+          left,
+          right,
+          pairedSampleCount: sampleCount,
+          averageAlignmentDeltaSeconds:
+            averageDeltaMs === null ? null : averageDeltaMs / 1000,
+          maximumAlignmentDeltaSeconds:
+            maximumDeltaMs === null ? null : maximumDeltaMs / 1000,
+        });
 
         if (coefficient !== null) {
           pairSummaries.push({
@@ -735,6 +839,8 @@ export default function Home() {
       keys,
       coefficientMatrix,
       sampleMatrix,
+      sensorDebugRows,
+      pairDebugRows,
       strongestPositivePair,
       strongestNegativePair,
       interpretations,
@@ -1698,6 +1804,83 @@ export default function Home() {
             <article className="rounded-xl border border-slate-800 bg-slate-950/50 p-4 lg:col-span-2">
               <div className="mb-3 rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-1.5 font-mono text-[11px] text-slate-400">
                 Time Range = {timeUnit === "all" ? "all" : `${timeAmount} ${timeUnit}`}&nbsp;&nbsp;|&nbsp;&nbsp;Window Points = {windowedNumericRecords.length}
+              </div>
+
+              <div className="mb-4 rounded-xl border border-amber-500/35 bg-amber-500/10 p-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-amber-100">Correlation Debug Panel (Temporary)</h3>
+                  <span className="rounded-full border border-amber-400/35 bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-100">
+                    diagnostics
+                  </span>
+                </div>
+
+                <div className="grid gap-3 xl:grid-cols-2">
+                  <div className="overflow-x-auto rounded-lg border border-slate-800 bg-slate-950/70">
+                    <table className="min-w-full text-xs">
+                      <thead className="bg-slate-950/80 text-left text-slate-400">
+                        <tr className="border-b border-slate-800">
+                          <th className="px-3 py-2 font-medium">Sensor</th>
+                          <th className="px-3 py-2 font-medium">Total Samples</th>
+                          <th className="px-3 py-2 font-medium">First Timestamp</th>
+                          <th className="px-3 py-2 font-medium">Last Timestamp</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {correlationAnalysis.sensorDebugRows.map((row) => (
+                          <tr key={`sensor-debug-${row.key}`} className="border-b border-slate-800/70">
+                            <td className="whitespace-nowrap px-3 py-2 text-slate-200">
+                              {correlationSensorLabelByKey[row.key]}
+                            </td>
+                            <td className="px-3 py-2 text-slate-300">{row.totalSamples}</td>
+                            <td className="whitespace-nowrap px-3 py-2 text-slate-400">
+                              {row.firstTimestampMs === null
+                                ? "N/A"
+                                : new Date(row.firstTimestampMs).toLocaleString()}
+                            </td>
+                            <td className="whitespace-nowrap px-3 py-2 text-slate-400">
+                              {row.lastTimestampMs === null
+                                ? "N/A"
+                                : new Date(row.lastTimestampMs).toLocaleString()}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="overflow-x-auto rounded-lg border border-slate-800 bg-slate-950/70">
+                    <table className="min-w-full text-xs">
+                      <thead className="bg-slate-950/80 text-left text-slate-400">
+                        <tr className="border-b border-slate-800">
+                          <th className="px-3 py-2 font-medium">Sensor Pair</th>
+                          <th className="px-3 py-2 font-medium">Paired n</th>
+                          <th className="px-3 py-2 font-medium">Avg Δ (s)</th>
+                          <th className="px-3 py-2 font-medium">Max Δ (s)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {correlationAnalysis.pairDebugRows.map((row) => (
+                          <tr key={`pair-debug-${row.left}-${row.right}`} className="border-b border-slate-800/70">
+                            <td className="whitespace-nowrap px-3 py-2 text-slate-200">
+                              {correlationSensorLabelByKey[row.left]} vs {correlationSensorLabelByKey[row.right]}
+                            </td>
+                            <td className="px-3 py-2 text-slate-300">{row.pairedSampleCount}</td>
+                            <td className="px-3 py-2 text-slate-400">
+                              {row.averageAlignmentDeltaSeconds === null
+                                ? "N/A"
+                                : row.averageAlignmentDeltaSeconds.toFixed(2)}
+                            </td>
+                            <td className="px-3 py-2 text-slate-400">
+                              {row.maximumAlignmentDeltaSeconds === null
+                                ? "N/A"
+                                : row.maximumAlignmentDeltaSeconds.toFixed(2)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               </div>
 
               <div className="overflow-x-auto rounded-xl border border-slate-800">
