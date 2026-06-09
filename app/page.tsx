@@ -15,6 +15,7 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Legend,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -48,6 +49,18 @@ type ChartType = "line" | "area" | "bar" | "scatter" | "step";
 type TimeUnit = "seconds" | "minutes" | "hours" | "days" | "all";
 type BehaviorScore = "Stable" | "Cautious" | "Warning" | "Critical";
 type DataSource = "demo" | "local" | null;
+type ComparisonSensorKey = "temperature" | "humidity" | "pressure" | "distance" | "accel";
+type ComparisonScaleMode = "raw" | "normalized";
+type ComparisonPoint = { timeMs: number } & Partial<Record<ComparisonSensorKey, number>>;
+
+type ComparisonSensorDefinition = {
+  key: ComparisonSensorKey;
+  label: string;
+  aliases: string[];
+  unit: string;
+  color: string;
+  dasharray?: string;
+};
 
 function parseMaybeNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -188,6 +201,46 @@ const MONTH_NAMES = [
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ] as const;
 
+const COMPARISON_SENSOR_DEFINITIONS: ComparisonSensorDefinition[] = [
+  {
+    key: "temperature",
+    label: "Temperature (temperature/temp)",
+    aliases: ["temperature", "temp"],
+    unit: "°C",
+    color: "#f59e0b",
+  },
+  {
+    key: "humidity",
+    label: "Humidity",
+    aliases: ["humidity"],
+    unit: "%",
+    color: "#38bdf8",
+  },
+  {
+    key: "pressure",
+    label: "Pressure",
+    aliases: ["pressure"],
+    unit: "hPa",
+    color: "#c084fc",
+    dasharray: "5 3",
+  },
+  {
+    key: "distance",
+    label: "Distance",
+    aliases: ["distance"],
+    unit: "cm",
+    color: "#34d399",
+  },
+  {
+    key: "accel",
+    label: "Accel",
+    aliases: ["accel", "acceleration"],
+    unit: "m/s²",
+    color: "#f87171",
+    dasharray: "3 3",
+  },
+];
+
 function formatTickLabel(timeMs: number, unit: TimeUnit): string {
   const d = new Date(timeMs);
   const hh = String(d.getHours()).padStart(2, "0");
@@ -209,6 +262,11 @@ export default function Home() {
   const [selectedChartType, setSelectedChartType] = useState<ChartType>("line");
   const [timeAmount, setTimeAmount] = useState<string>("10");
   const [timeUnit, setTimeUnit] = useState<TimeUnit>("minutes");
+  const [selectedComparisonSensors, setSelectedComparisonSensors] = useState<ComparisonSensorKey[]>([
+    "temperature",
+    "humidity",
+  ]);
+  const [comparisonScaleMode, setComparisonScaleMode] = useState<ComparisonScaleMode>("raw");
 
   useEffect(() => {
     let isCancelled = false;
@@ -273,6 +331,29 @@ export default function Home() {
   const numericRecords = useMemo(() => {
     return records.filter((r) => r.value !== null) as Array<SensorRecord & { value: number }>;
   }, [records]);
+
+  const availableComparisonSensorKeys = useMemo(() => {
+    const availableSensors = new Set(numericRecords.map((record) => record.sensor));
+
+    return COMPARISON_SENSOR_DEFINITIONS
+      .filter((sensorDef) => sensorDef.aliases.some((alias) => availableSensors.has(alias)))
+      .map((sensorDef) => sensorDef.key);
+  }, [numericRecords]);
+
+  useEffect(() => {
+    const filtered = selectedComparisonSensors.filter((sensor) =>
+      availableComparisonSensorKeys.includes(sensor),
+    );
+
+    if (filtered.length !== selectedComparisonSensors.length) {
+      setSelectedComparisonSensors(filtered);
+      return;
+    }
+
+    if (filtered.length === 0 && availableComparisonSensorKeys.length > 0) {
+      setSelectedComparisonSensors(availableComparisonSensorKeys.slice(0, 2));
+    }
+  }, [availableComparisonSensorKeys, selectedComparisonSensors]);
 
   const windowedNumericRecords = useMemo(() => {
     if (timeUnit === "all") return numericRecords;
@@ -361,6 +442,101 @@ export default function Home() {
       points: values.length,
     };
   }, [selectedSeries, selectedChartType]);
+
+  const selectedComparisonDefinitions = useMemo(() => {
+    return COMPARISON_SENSOR_DEFINITIONS.filter((sensorDef) =>
+      selectedComparisonSensors.includes(sensorDef.key),
+    );
+  }, [selectedComparisonSensors]);
+
+  const comparisonChartData = useMemo<ComparisonPoint[]>(() => {
+    if (selectedComparisonSensors.length === 0) {
+      return [];
+    }
+
+    const selectedKeySet = new Set(selectedComparisonSensors);
+    const byTime = new Map<number, ComparisonPoint>();
+
+    for (const record of windowedNumericRecords) {
+      const definition = COMPARISON_SENSOR_DEFINITIONS.find((sensorDef) =>
+        sensorDef.aliases.includes(record.sensor),
+      );
+
+      if (!definition || !selectedKeySet.has(definition.key)) {
+        continue;
+      }
+
+      const existing = byTime.get(record.timeMs);
+      if (existing) {
+        existing[definition.key] = record.value;
+      } else {
+        byTime.set(record.timeMs, {
+          timeMs: record.timeMs,
+          [definition.key]: record.value,
+        });
+      }
+    }
+
+    const ordered = Array.from(byTime.values()).sort((a, b) => a.timeMs - b.timeMs);
+
+    if (comparisonScaleMode === "raw") {
+      return ordered;
+    }
+
+    const ranges: Partial<Record<ComparisonSensorKey, { min: number; max: number }>> = {};
+
+    for (const sensorDef of selectedComparisonDefinitions) {
+      const values = ordered
+        .map((point) => point[sensorDef.key])
+        .filter((value): value is number => typeof value === "number");
+
+      if (values.length > 0) {
+        ranges[sensorDef.key] = {
+          min: Math.min(...values),
+          max: Math.max(...values),
+        };
+      }
+    }
+
+    return ordered.map((point) => {
+      const normalizedPoint: ComparisonPoint = { timeMs: point.timeMs };
+
+      for (const sensorDef of selectedComparisonDefinitions) {
+        const value = point[sensorDef.key];
+        const range = ranges[sensorDef.key];
+
+        if (typeof value !== "number" || !range) {
+          continue;
+        }
+
+        if (range.max === range.min) {
+          normalizedPoint[sensorDef.key] = 100;
+          continue;
+        }
+
+        normalizedPoint[sensorDef.key] = ((value - range.min) / (range.max - range.min)) * 100;
+      }
+
+      return normalizedPoint;
+    });
+  }, [comparisonScaleMode, selectedComparisonDefinitions, selectedComparisonSensors, windowedNumericRecords]);
+
+  const comparisonXAxisTickCount = useMemo(() => {
+    const n = comparisonChartData.length;
+    if (n <= 6) return n;
+    if (timeUnit === "seconds" || timeUnit === "minutes" || timeUnit === "hours") return 8;
+    return 7;
+  }, [comparisonChartData.length, timeUnit]);
+
+  const toggleComparisonSensor = (sensorKey: ComparisonSensorKey) => {
+    setSelectedComparisonSensors((previous) => {
+      if (previous.includes(sensorKey)) {
+        return previous.filter((key) => key !== sensorKey);
+      }
+
+      return [...previous, sensorKey];
+    });
+  };
 
   const latestTemperature = findLatestValue(numericRecords, ["temperature", "temp"]);
   const latestHumidity = findLatestValue(numericRecords, ["humidity"]);
@@ -579,6 +755,52 @@ export default function Home() {
       return b.percentageJump - a.percentageJump;
     })[0] ?? null;
   }, [suddenJumps]);
+
+  const renderComparisonTooltip = (props: { active?: boolean; label?: string | number }) => {
+    if (!props.active) {
+      return null;
+    }
+
+    const timeMs =
+      typeof props.label === "number"
+        ? props.label
+        : typeof props.label === "string"
+          ? Number(props.label)
+          : NaN;
+
+    if (!Number.isFinite(timeMs)) {
+      return null;
+    }
+
+    const pointAtTimestamp = comparisonChartData.find((point) => point.timeMs === timeMs);
+
+    return (
+      <div className="rounded-lg border border-slate-700 bg-slate-950/95 px-3 py-2 text-xs text-slate-200">
+        <p className="mb-2 border-b border-slate-800 pb-1 text-slate-400">
+          {formatTickLabel(timeMs, timeUnit)}
+        </p>
+        <div className="space-y-1.5">
+          {selectedComparisonDefinitions.map((sensorDef) => {
+            const rawValue = pointAtTimestamp?.[sensorDef.key];
+            const displayValue =
+              typeof rawValue === "number"
+                ? `${rawValue.toFixed(2)} ${comparisonScaleMode === "normalized" ? "%" : sensorDef.unit}`
+                : "--";
+
+            return (
+              <div key={sensorDef.key} className="flex items-center justify-between gap-3">
+                <span className="flex items-center gap-2 text-slate-300">
+                  <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: sensorDef.color }} />
+                  {sensorDef.label}
+                </span>
+                <span className="font-mono text-slate-100">{displayValue}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100">
@@ -1078,6 +1300,144 @@ export default function Home() {
                   </p>
                 </div>
               </div>
+            </aside>
+          </div>
+        </section>
+
+        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+          <div className="mb-4">
+            <h2 className="text-lg font-semibold text-slate-100">Multi-Sensor Comparison</h2>
+            <p className="text-xs text-slate-500">
+              Comparative trend inspection across selected sensors using the active time window filter
+            </p>
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-4">
+            <article className="rounded-xl border border-slate-800 bg-slate-950/50 p-4 lg:col-span-3">
+              <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <h3 className="text-base font-medium text-slate-200">Sensor Trend Overlay</h3>
+
+                <div className="inline-flex rounded-lg border border-slate-700 bg-slate-950 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setComparisonScaleMode("raw")}
+                    className={`rounded-md px-3 py-1.5 text-xs font-medium transition sm:text-sm ${
+                      comparisonScaleMode === "raw"
+                        ? "bg-slate-800 text-slate-100"
+                        : "text-slate-300 hover:text-slate-100"
+                    }`}
+                  >
+                    Raw Values
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setComparisonScaleMode("normalized")}
+                    className={`rounded-md px-3 py-1.5 text-xs font-medium transition sm:text-sm ${
+                      comparisonScaleMode === "normalized"
+                        ? "bg-slate-800 text-slate-100"
+                        : "text-slate-300 hover:text-slate-100"
+                    }`}
+                  >
+                    Normalized 0-100
+                  </button>
+                </div>
+              </div>
+
+              <div className="mb-3 rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-1.5 font-mono text-[11px] text-slate-400">
+                Selected Sensors = {selectedComparisonSensors.length}&nbsp;&nbsp;|&nbsp;&nbsp;Points = {comparisonChartData.length}&nbsp;&nbsp;|&nbsp;&nbsp;Scale = {comparisonScaleMode === "raw" ? "raw" : "normalized_0_100"}&nbsp;&nbsp;|&nbsp;&nbsp;Time Range = {timeUnit === "all" ? "all" : `${timeAmount} ${timeUnit}`}
+              </div>
+
+              <div className="h-80 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={comparisonChartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                    <XAxis
+                      dataKey="timeMs"
+                      type="number"
+                      scale="time"
+                      domain={["dataMin", "dataMax"]}
+                      tickCount={comparisonXAxisTickCount}
+                      tickFormatter={(v: number) => formatTickLabel(v, timeUnit)}
+                      tick={{ fill: "#94a3b8", fontSize: 11 }}
+                      minTickGap={40}
+                    />
+                    <YAxis
+                      tick={{ fill: "#94a3b8", fontSize: 11 }}
+                      width={comparisonScaleMode === "normalized" ? 60 : 70}
+                      domain={comparisonScaleMode === "normalized" ? [0, 100] : ["auto", "auto"]}
+                    />
+                    <Tooltip
+                      filterNull={false}
+                      content={renderComparisonTooltip}
+                    />
+                    <Legend
+                      verticalAlign="top"
+                      align="right"
+                      wrapperStyle={{ color: "#cbd5e1", fontSize: "12px" }}
+                    />
+                    {selectedComparisonDefinitions.map((sensorDef) => (
+                      <Line
+                        key={sensorDef.key}
+                        type="monotone"
+                        dataKey={sensorDef.key}
+                        name={sensorDef.label}
+                        stroke={sensorDef.color}
+                        strokeWidth={2.2}
+                        strokeDasharray={sensorDef.dasharray}
+                        dot={false}
+                        activeDot={{ r: 4 }}
+                        connectNulls
+                        isAnimationActive
+                      />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </article>
+
+            <aside className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+              <h3 className="text-base font-medium text-slate-200">Comparison Controls</h3>
+              <p className="mt-1 text-xs text-slate-500">
+                Select one or more sensors to overlay on the shared timeline
+              </p>
+
+              <div className="mt-3 space-y-2">
+                {COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => {
+                  const isAvailable = availableComparisonSensorKeys.includes(sensorDef.key);
+                  const isChecked = selectedComparisonSensors.includes(sensorDef.key);
+
+                  return (
+                    <label
+                      key={sensorDef.key}
+                      className={`flex items-center justify-between rounded-lg border px-3 py-2 text-sm ${
+                        isAvailable
+                          ? "border-slate-800 bg-slate-950 text-slate-200"
+                          : "border-slate-800/70 bg-slate-950/40 text-slate-500"
+                      }`}
+                    >
+                      <span className="mr-3 flex items-center gap-2">
+                        <span
+                          className="h-2.5 w-2.5 rounded-full"
+                          style={{ backgroundColor: sensorDef.color }}
+                        />
+                        {sensorDef.label}
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        disabled={!isAvailable}
+                        onChange={() => toggleComparisonSensor(sensorDef.key)}
+                        className="h-4 w-4 rounded border-slate-600 bg-slate-900 text-sky-500 focus:ring-sky-500"
+                        aria-label={`Toggle ${sensorDef.label}`}
+                      />
+                    </label>
+                  );
+                })}
+              </div>
+
+              <p className="mt-3 rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-[11px] text-slate-500">
+                Sensors without numeric observations in the selected dataset are shown but unavailable.
+              </p>
             </aside>
           </div>
         </section>
