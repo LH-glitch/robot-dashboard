@@ -42,6 +42,7 @@ type SuddenJump = {
   absoluteJump: number;
   percentageJump: number;
   time: string;
+  timeMs: number;
   severity: "High" | "Medium" | "Low";
 };
 
@@ -88,6 +89,26 @@ type CorrelationPairDebug = {
   averageAlignmentDeltaSeconds: number | null;
   maximumAlignmentDeltaSeconds: number | null;
 };
+
+type HeatmapCell = {
+  sensorKey: ComparisonSensorKey;
+  sensorLabel: string;
+  bucketIndex: number;
+  bucketStartMs: number;
+  bucketEndMs: number;
+  averageValue: number | null;
+  sampleCount: number;
+  normalizedValue: number | null;
+};
+
+type HeatmapHoverInfo = {
+  sensorLabel: string;
+  bucketLabel: string;
+  averageValue: number | null;
+  sampleCount: number;
+};
+
+type AnomalySeverityFilter = "All" | SuddenJump["severity"];
 
 function parseMaybeNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -215,6 +236,7 @@ function calculateSuddenJumps(records: Array<SensorRecord & { value: number }>):
         absoluteJump,
         percentageJump,
         time: curr.time,
+        timeMs: curr.timeMs,
         severity,
       });
     }
@@ -369,6 +391,36 @@ function alignByNearestNeighbor(
   return { alignedSource, alignedTarget, deltasMs };
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function interpolateRgb(start: [number, number, number], end: [number, number, number], t: number): [number, number, number] {
+  return [
+    Math.round(start[0] + (end[0] - start[0]) * t),
+    Math.round(start[1] + (end[1] - start[1]) * t),
+    Math.round(start[2] + (end[2] - start[2]) * t),
+  ];
+}
+
+function heatmapColorFromNormalized(value: number | null): string {
+  if (value === null) {
+    return "#0f172a";
+  }
+
+  const clamped = clamp(value, 0, 100);
+  const darkBlue: [number, number, number] = [13, 42, 148];
+  const cyan: [number, number, number] = [34, 211, 238];
+  const yellow: [number, number, number] = [250, 204, 21];
+
+  const rgb =
+    clamped <= 50
+      ? interpolateRgb(darkBlue, cyan, clamped / 50)
+      : interpolateRgb(cyan, yellow, (clamped - 50) / 50);
+
+  return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+}
+
 export default function Home() {
   const [records, setRecords] = useState<SensorRecord[]>([]);
   const [dataSource, setDataSource] = useState<DataSource>(null);
@@ -382,6 +434,8 @@ export default function Home() {
     "humidity",
   ]);
   const [comparisonScaleMode, setComparisonScaleMode] = useState<ComparisonScaleMode>("raw");
+  const [anomalySeverityFilter, setAnomalySeverityFilter] = useState<AnomalySeverityFilter>("All");
+  const [hoveredHeatmapCell, setHoveredHeatmapCell] = useState<HeatmapHoverInfo | null>(null);
 
   useEffect(() => {
     let isCancelled = false;
@@ -874,6 +928,209 @@ export default function Home() {
   const suddenJumps = useMemo((): SuddenJump[] => {
     return allSuddenJumps.slice(0, 10);
   }, [allSuddenJumps]);
+
+  const anomalyTimelineEvents = useMemo((): SuddenJump[] => {
+    const filtered =
+      anomalySeverityFilter === "All"
+        ? allSuddenJumps
+        : allSuddenJumps.filter((jump) => jump.severity === anomalySeverityFilter);
+
+    return [...filtered].sort((a, b) => b.timeMs - a.timeMs).slice(0, 20);
+  }, [allSuddenJumps, anomalySeverityFilter]);
+
+  const heatmapAnalysis = useMemo(() => {
+    const sensorRows = COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => ({
+      key: sensorDef.key,
+      label: sensorDef.label.split(" (")[0],
+      aliases: sensorDef.aliases,
+    }));
+
+    if (windowedNumericRecords.length === 0) {
+      return {
+        sensorRows,
+        bucketCount: 0,
+        totalSamplesUsed: 0,
+        bucketStartMsList: [] as number[],
+        bucketEndMsList: [] as number[],
+        cellsBySensor: {} as Record<ComparisonSensorKey, HeatmapCell[]>,
+        insights: ["No numeric values in the current filter window. Heatmap cannot be computed."],
+      };
+    }
+
+    const minTimeMs = windowedNumericRecords[0].timeMs;
+    const maxTimeMs = windowedNumericRecords[windowedNumericRecords.length - 1].timeMs;
+    const rawWindowMs = Math.max(1, maxTimeMs - minTimeMs);
+
+    let bucketCount = 12;
+    if (timeUnit === "all") {
+      bucketCount = 30;
+    } else if (timeUnit === "days") {
+      bucketCount = 24;
+    } else {
+      const minutesInWindow = rawWindowMs / (60 * 1000);
+      bucketCount = clamp(Math.round(minutesInWindow / 2), 8, 30);
+    }
+
+    const bucketSizeMs = Math.max(1, Math.ceil(rawWindowMs / bucketCount));
+    const bucketStartMsList = Array.from({ length: bucketCount }, (_, index) => minTimeMs + index * bucketSizeMs);
+    const bucketEndMsList = Array.from({ length: bucketCount }, (_, index) => {
+      const nextStart = minTimeMs + (index + 1) * bucketSizeMs;
+      return index === bucketCount - 1 ? maxTimeMs : Math.max(minTimeMs, nextStart - 1);
+    });
+
+    const sumsBySensor = sensorRows.reduce<Record<ComparisonSensorKey, number[]>>(
+      (acc, row) => {
+        acc[row.key] = Array(bucketCount).fill(0);
+        return acc;
+      },
+      {
+        temperature: [],
+        humidity: [],
+        pressure: [],
+        distance: [],
+        accel: [],
+      },
+    );
+
+    const countsBySensor = sensorRows.reduce<Record<ComparisonSensorKey, number[]>>(
+      (acc, row) => {
+        acc[row.key] = Array(bucketCount).fill(0);
+        return acc;
+      },
+      {
+        temperature: [],
+        humidity: [],
+        pressure: [],
+        distance: [],
+        accel: [],
+      },
+    );
+
+    for (const record of windowedNumericRecords) {
+      const matchingSensor = sensorRows.find((row) => row.aliases.includes(record.sensor));
+      if (!matchingSensor) {
+        continue;
+      }
+
+      const relativeMs = record.timeMs - minTimeMs;
+      const bucketIndex = clamp(Math.floor(relativeMs / bucketSizeMs), 0, bucketCount - 1);
+      sumsBySensor[matchingSensor.key][bucketIndex] += record.value;
+      countsBySensor[matchingSensor.key][bucketIndex] += 1;
+    }
+
+    const averagesBySensor = sensorRows.reduce<Record<ComparisonSensorKey, Array<number | null>>>(
+      (acc, row) => {
+        acc[row.key] = Array.from({ length: bucketCount }, (_, index) => {
+          const count = countsBySensor[row.key][index];
+          if (count === 0) {
+            return null;
+          }
+          return sumsBySensor[row.key][index] / count;
+        });
+        return acc;
+      },
+      {
+        temperature: [],
+        humidity: [],
+        pressure: [],
+        distance: [],
+        accel: [],
+      },
+    );
+
+    const normalizedBySensor = sensorRows.reduce<Record<ComparisonSensorKey, Array<number | null>>>(
+      (acc, row) => {
+        const values = averagesBySensor[row.key].filter((v): v is number => typeof v === "number");
+        const min = values.length > 0 ? Math.min(...values) : null;
+        const max = values.length > 0 ? Math.max(...values) : null;
+
+        acc[row.key] = averagesBySensor[row.key].map((value) => {
+          if (value === null || min === null || max === null) {
+            return null;
+          }
+          if (max === min) {
+            return 50;
+          }
+          return ((value - min) / (max - min)) * 100;
+        });
+        return acc;
+      },
+      {
+        temperature: [],
+        humidity: [],
+        pressure: [],
+        distance: [],
+        accel: [],
+      },
+    );
+
+    const cellsBySensor = sensorRows.reduce<Record<ComparisonSensorKey, HeatmapCell[]>>(
+      (acc, row) => {
+        acc[row.key] = Array.from({ length: bucketCount }, (_, bucketIndex) => ({
+          sensorKey: row.key,
+          sensorLabel: row.label,
+          bucketIndex,
+          bucketStartMs: bucketStartMsList[bucketIndex],
+          bucketEndMs: bucketEndMsList[bucketIndex],
+          averageValue: averagesBySensor[row.key][bucketIndex],
+          sampleCount: countsBySensor[row.key][bucketIndex],
+          normalizedValue: normalizedBySensor[row.key][bucketIndex],
+        }));
+        return acc;
+      },
+      {
+        temperature: [],
+        humidity: [],
+        pressure: [],
+        distance: [],
+        accel: [],
+      },
+    );
+
+    const totalSamplesUsed = sensorRows.reduce(
+      (sum, row) => sum + countsBySensor[row.key].reduce((rowSum, count) => rowSum + count, 0),
+      0,
+    );
+
+    const insights: string[] = [];
+    for (const row of sensorRows) {
+      const values = averagesBySensor[row.key].filter((v): v is number => typeof v === "number");
+      if (values.length < 2) {
+        continue;
+      }
+
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+      const span = max - min;
+
+      const normalizedValues = normalizedBySensor[row.key].filter((v): v is number => typeof v === "number");
+      const normalizedAvg =
+        normalizedValues.length > 0
+          ? normalizedValues.reduce((sum, value) => sum + value, 0) / normalizedValues.length
+          : 50;
+
+      if (span <= Math.max(0.05, Math.abs(avg) * 0.1)) {
+        insights.push(`${row.label} remained stable across the selected timeline.`);
+      } else if (normalizedAvg >= 70) {
+        insights.push(`${row.label} remained consistently high across most buckets.`);
+      } else if (normalizedAvg <= 30) {
+        insights.push(`${row.label} remained consistently low across most buckets.`);
+      } else if (span >= Math.max(0.2, Math.abs(avg) * 0.5)) {
+        insights.push(`${row.label} showed large variation across time buckets.`);
+      }
+    }
+
+    return {
+      sensorRows,
+      bucketCount,
+      totalSamplesUsed,
+      bucketStartMsList,
+      bucketEndMsList,
+      cellsBySensor,
+      insights: insights.slice(0, 6),
+    };
+  }, [timeUnit, windowedNumericRecords]);
 
   const aiAnalysis = useMemo(() => {
     const insights: string[] = [];
@@ -1978,6 +2235,226 @@ export default function Home() {
               </div>
             </aside>
           </div>
+        </section>
+
+        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+          <div className="mb-4">
+            <h2 className="text-lg font-semibold text-slate-100">Sensor Heatmap Analysis</h2>
+            <p className="text-xs text-slate-500">
+              Heatmaps help researchers identify patterns, clusters, and abnormal behavior across multiple sensors over time.
+            </p>
+          </div>
+
+          <div className="mb-4 grid gap-3 sm:grid-cols-3">
+            <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
+              <p className="text-[11px] uppercase tracking-wide text-slate-500">Total Sensors</p>
+              <p className="mt-1 text-sm font-semibold text-slate-200">{heatmapAnalysis.sensorRows.length}</p>
+            </div>
+            <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
+              <p className="text-[11px] uppercase tracking-wide text-slate-500">Total Buckets</p>
+              <p className="mt-1 text-sm font-semibold text-slate-200">{heatmapAnalysis.bucketCount}</p>
+            </div>
+            <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
+              <p className="text-[11px] uppercase tracking-wide text-slate-500">Total Samples Used</p>
+              <p className="mt-1 text-sm font-semibold text-slate-200">{heatmapAnalysis.totalSamplesUsed}</p>
+            </div>
+          </div>
+
+          <div className="mb-3 rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-1.5 font-mono text-[11px] text-slate-400">
+            Time Range = {selectedTimeWindowLabel}&nbsp;&nbsp;|&nbsp;&nbsp;Heatmap Mode = per_sensor_normalized
+          </div>
+
+          {heatmapAnalysis.bucketCount === 0 ? (
+            <p className="text-sm text-slate-500">No numeric telemetry available for heatmap generation.</p>
+          ) : (
+            <div className="space-y-4">
+              <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                <div className="min-w-[900px] space-y-2">
+                  {heatmapAnalysis.sensorRows.map((row) => (
+                    <div key={row.key} className="grid items-center gap-2" style={{ gridTemplateColumns: `11rem repeat(${heatmapAnalysis.bucketCount}, minmax(0, 1fr))` }}>
+                      <div className="pr-2 text-xs font-medium text-slate-300">{row.label}</div>
+                      {heatmapAnalysis.cellsBySensor[row.key].map((cell) => {
+                        const bucketLabel =
+                          `${formatTickLabel(cell.bucketStartMs, timeUnit)} - ${formatTickLabel(cell.bucketEndMs, timeUnit)}`;
+                        return (
+                          <button
+                            key={`${row.key}-${cell.bucketIndex}`}
+                            type="button"
+                            className="h-7 rounded-sm border border-slate-900/70 transition hover:scale-[1.02]"
+                            style={{ backgroundColor: heatmapColorFromNormalized(cell.normalizedValue) }}
+                            title={`Sensor: ${row.label}\nTime bucket: ${bucketLabel}\nAverage: ${cell.averageValue === null ? "N/A" : cell.averageValue.toFixed(2)}\nSamples: ${cell.sampleCount}`}
+                            onMouseEnter={() =>
+                              setHoveredHeatmapCell({
+                                sensorLabel: row.label,
+                                bucketLabel,
+                                averageValue: cell.averageValue,
+                                sampleCount: cell.sampleCount,
+                              })
+                            }
+                            onFocus={() =>
+                              setHoveredHeatmapCell({
+                                sensorLabel: row.label,
+                                bucketLabel,
+                                averageValue: cell.averageValue,
+                                sampleCount: cell.sampleCount,
+                              })
+                            }
+                            onMouseLeave={() => setHoveredHeatmapCell(null)}
+                            onBlur={() => setHoveredHeatmapCell(null)}
+                            aria-label={`${row.label} ${bucketLabel} average ${cell.averageValue === null ? "N/A" : cell.averageValue.toFixed(2)} samples ${cell.sampleCount}`}
+                          />
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
+                <div className="flex items-center gap-2 text-xs text-slate-300">
+                  <span>Low</span>
+                  <div className="h-3 w-48 rounded-full" style={{ background: "linear-gradient(90deg, rgb(13, 42, 148) 0%, rgb(34, 211, 238) 50%, rgb(250, 204, 21) 100%)" }} />
+                  <span>Medium</span>
+                  <span>High</span>
+                </div>
+
+                <div className="text-xs text-slate-400">
+                  {hoveredHeatmapCell ? (
+                    <div className="space-y-0.5 text-right">
+                      <p>Sensor: <span className="text-slate-200">{hoveredHeatmapCell.sensorLabel}</span></p>
+                      <p>Time Bucket: <span className="text-slate-200">{hoveredHeatmapCell.bucketLabel}</span></p>
+                      <p>Average Value: <span className="text-slate-200">{hoveredHeatmapCell.averageValue === null ? "N/A" : hoveredHeatmapCell.averageValue.toFixed(2)}</span></p>
+                      <p>Sample Count: <span className="text-slate-200">{hoveredHeatmapCell.sampleCount}</span></p>
+                    </div>
+                  ) : (
+                    <p>Hover a heatmap cell to view bucket details.</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
+                <p className="mb-2 text-[11px] uppercase tracking-wide text-slate-500">Automatic Insights</p>
+                {heatmapAnalysis.insights.length === 0 ? (
+                  <p className="text-sm text-slate-500">Insufficient variation to generate heatmap insights for this time window.</p>
+                ) : (
+                  <ul className="space-y-1.5 text-sm text-slate-300">
+                    {heatmapAnalysis.insights.map((insight, index) => (
+                      <li key={`${insight}-${index}`} className="flex items-start gap-2">
+                        <span className="mt-1 h-1.5 w-1.5 rounded-full bg-cyan-300" />
+                        <span>{insight}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+
+        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+          <div className="mb-4">
+            <h2 className="text-lg font-semibold text-slate-100">Anomaly Timeline</h2>
+            <p className="text-xs text-slate-500">
+              Chronological event log of sudden telemetry jumps across all numeric sensors
+            </p>
+          </div>
+
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            {(["All", "High", "Medium", "Low"] as AnomalySeverityFilter[]).map((filterKey) => {
+              const isActive = anomalySeverityFilter === filterKey;
+              return (
+                <button
+                  key={filterKey}
+                  type="button"
+                  onClick={() => setAnomalySeverityFilter(filterKey)}
+                  className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition sm:text-sm ${
+                    isActive
+                      ? filterKey === "High"
+                        ? "border-red-500/60 bg-red-500/15 text-red-200"
+                        : filterKey === "Medium"
+                          ? "border-amber-500/60 bg-amber-500/15 text-amber-200"
+                          : filterKey === "Low"
+                            ? "border-slate-500/60 bg-slate-700/40 text-slate-200"
+                            : "border-sky-500/60 bg-sky-500/10 text-sky-200"
+                      : "border-slate-700 bg-slate-950 text-slate-300 hover:border-slate-500"
+                  }`}
+                >
+                  {filterKey}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="mb-3 rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-1.5 font-mono text-[11px] text-slate-400">
+            Severity Filter = {anomalySeverityFilter}&nbsp;&nbsp;|&nbsp;&nbsp;Events Shown = {anomalyTimelineEvents.length}&nbsp;&nbsp;|&nbsp;&nbsp;Order = newest_to_oldest
+          </div>
+
+          {anomalyTimelineEvents.length === 0 ? (
+            <p className="text-sm text-slate-500">No anomaly events found for the selected severity filter.</p>
+          ) : (
+            <div className="space-y-0">
+              {anomalyTimelineEvents.map((event, index) => {
+                const isLast = index === anomalyTimelineEvents.length - 1;
+                const severityColorClass =
+                  event.severity === "High"
+                    ? "bg-red-400"
+                    : event.severity === "Medium"
+                      ? "bg-amber-300"
+                      : "bg-slate-300";
+
+                const severityBadgeClass =
+                  event.severity === "High"
+                    ? "bg-red-500/20 text-red-300"
+                    : event.severity === "Medium"
+                      ? "bg-amber-500/20 text-amber-300"
+                      : "bg-slate-700 text-slate-300";
+
+                return (
+                  <article key={`${event.sensor}-${event.time}-${index}`} className="relative pl-10">
+                    {!isLast && <span className="absolute left-[0.8rem] top-6 h-[calc(100%-0.25rem)] w-px bg-slate-700" />}
+                    <span className={`absolute left-0 top-5 h-3 w-3 rounded-full border border-slate-900 ${severityColorClass}`} />
+
+                    <div className="mb-3 rounded-xl border border-slate-800 bg-slate-950/50 p-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-sm font-medium capitalize text-slate-200">{event.sensor}</p>
+                        <span
+                          className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${severityBadgeClass}`}
+                        >
+                          <AlertTriangle className="h-3 w-3" />
+                          {event.severity}
+                        </span>
+                      </div>
+
+                      <p className="mt-1 text-xs text-slate-400">{new Date(event.timeMs).toLocaleString()}</p>
+
+                      <div className="mt-2 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-5">
+                        <div className="rounded-lg border border-slate-800 bg-slate-950 px-2 py-1.5 text-slate-300">
+                          <p className="uppercase tracking-wide text-slate-500">Previous</p>
+                          <p className="mt-1 font-mono text-slate-200">{event.prevValue.toFixed(2)}</p>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-slate-950 px-2 py-1.5 text-slate-300">
+                          <p className="uppercase tracking-wide text-slate-500">Current</p>
+                          <p className="mt-1 font-mono text-slate-200">{event.currValue.toFixed(2)}</p>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-slate-950 px-2 py-1.5 text-slate-300">
+                          <p className="uppercase tracking-wide text-slate-500">Abs. Jump</p>
+                          <p className="mt-1 font-mono text-slate-200">{event.absoluteJump.toFixed(2)}</p>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-slate-950 px-2 py-1.5 text-slate-300">
+                          <p className="uppercase tracking-wide text-slate-500">% Jump</p>
+                          <p className="mt-1 font-mono text-slate-200">{event.percentageJump.toFixed(1)}%</p>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-slate-950 px-2 py-1.5 text-slate-300">
+                          <p className="uppercase tracking-wide text-slate-500">Timestamp</p>
+                          <p className="mt-1 font-mono text-slate-200">{event.time}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          )}
         </section>
 
         <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
