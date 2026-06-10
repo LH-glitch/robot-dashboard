@@ -108,6 +108,13 @@ type HeatmapHoverInfo = {
   sampleCount: number;
 };
 
+type HeatmapViewMode =
+  | "grid"
+  | "compact"
+  | "stripes"
+  | "table"
+  | "intensity-cards";
+
 type AnomalySeverityFilter = "All" | SuddenJump["severity"];
 
 function parseMaybeNumber(value: unknown): number | null {
@@ -436,6 +443,7 @@ export default function Home() {
   const [comparisonScaleMode, setComparisonScaleMode] = useState<ComparisonScaleMode>("raw");
   const [anomalySeverityFilter, setAnomalySeverityFilter] = useState<AnomalySeverityFilter>("All");
   const [hoveredHeatmapCell, setHoveredHeatmapCell] = useState<HeatmapHoverInfo | null>(null);
+  const [heatmapViewMode, setHeatmapViewMode] = useState<HeatmapViewMode>("grid");
 
   useEffect(() => {
     let isCancelled = false;
@@ -1131,6 +1139,52 @@ export default function Home() {
       insights: insights.slice(0, 6),
     };
   }, [timeUnit, windowedNumericRecords]);
+
+  const heatmapViewModes: Array<{ key: HeatmapViewMode; label: string }> = [
+    { key: "grid", label: "Grid Heatmap" },
+    { key: "compact", label: "Compact Heatmap" },
+    { key: "stripes", label: "Sensor Stripes" },
+    { key: "table", label: "Bucket Table" },
+    { key: "intensity-cards", label: "Intensity Cards" },
+  ];
+
+  const heatmapIntensityCards = useMemo(() => {
+    return heatmapAnalysis.sensorRows.map((row) => {
+      const cells = heatmapAnalysis.cellsBySensor[row.key] ?? [];
+      const values = cells
+        .map((cell) => cell.averageValue)
+        .filter((value): value is number => typeof value === "number");
+
+      const min = values.length > 0 ? Math.min(...values) : null;
+      const max = values.length > 0 ? Math.max(...values) : null;
+      const avg =
+        values.length > 0
+          ? values.reduce((sum, value) => sum + value, 0) / values.length
+          : null;
+
+      const variation =
+        min !== null && max !== null && avg !== null
+          ? max - min
+          : null;
+
+      let variationLevel = "Low";
+      if (variation !== null && avg !== null) {
+        const threshold = Math.max(Math.abs(avg), 0.1);
+        const ratio = variation / threshold;
+        variationLevel = ratio >= 0.8 ? "High" : ratio >= 0.35 ? "Medium" : "Low";
+      }
+
+      return {
+        key: row.key,
+        label: row.label,
+        cells,
+        min,
+        max,
+        avg,
+        variationLevel,
+      };
+    });
+  }, [heatmapAnalysis]);
 
   const aiAnalysis = useMemo(() => {
     const insights: string[] = [];
@@ -2239,7 +2293,28 @@ export default function Home() {
 
         <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
           <div className="mb-4">
-            <h2 className="text-lg font-semibold text-slate-100">Sensor Heatmap Analysis</h2>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <h2 className="text-lg font-semibold text-slate-100">Sensor Heatmap Analysis</h2>
+              <div className="flex flex-wrap items-center gap-2">
+                {heatmapViewModes.map((mode) => {
+                  const isActive = heatmapViewMode === mode.key;
+                  return (
+                    <button
+                      key={mode.key}
+                      type="button"
+                      onClick={() => setHeatmapViewMode(mode.key)}
+                      className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition sm:text-sm ${
+                        isActive
+                          ? "border-cyan-500/60 bg-cyan-500/10 text-cyan-200"
+                          : "border-slate-700 bg-slate-950 text-slate-300 hover:border-slate-500"
+                      }`}
+                    >
+                      {mode.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
             <p className="text-xs text-slate-500">
               Heatmaps help researchers identify patterns, clusters, and abnormal behavior across multiple sensors over time.
             </p>
@@ -2261,54 +2336,234 @@ export default function Home() {
           </div>
 
           <div className="mb-3 rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-1.5 font-mono text-[11px] text-slate-400">
-            Time Range = {selectedTimeWindowLabel}&nbsp;&nbsp;|&nbsp;&nbsp;Heatmap Mode = per_sensor_normalized
+            Time Range = {selectedTimeWindowLabel}&nbsp;&nbsp;|&nbsp;&nbsp;Heatmap Mode = {heatmapViewModes.find((mode) => mode.key === heatmapViewMode)?.label ?? "Grid Heatmap"}&nbsp;&nbsp;|&nbsp;&nbsp;Normalization = per_sensor
           </div>
 
           {heatmapAnalysis.bucketCount === 0 ? (
             <p className="text-sm text-slate-500">No numeric telemetry available for heatmap generation.</p>
           ) : (
             <div className="space-y-4">
-              <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/40 p-3">
-                <div className="min-w-[900px] space-y-2">
-                  {heatmapAnalysis.sensorRows.map((row) => (
-                    <div key={row.key} className="grid items-center gap-2" style={{ gridTemplateColumns: `11rem repeat(${heatmapAnalysis.bucketCount}, minmax(0, 1fr))` }}>
-                      <div className="pr-2 text-xs font-medium text-slate-300">{row.label}</div>
-                      {heatmapAnalysis.cellsBySensor[row.key].map((cell) => {
-                        const bucketLabel =
-                          `${formatTickLabel(cell.bucketStartMs, timeUnit)} - ${formatTickLabel(cell.bucketEndMs, timeUnit)}`;
-                        return (
-                          <button
-                            key={`${row.key}-${cell.bucketIndex}`}
-                            type="button"
-                            className="h-7 rounded-sm border border-slate-900/70 transition hover:scale-[1.02]"
-                            style={{ backgroundColor: heatmapColorFromNormalized(cell.normalizedValue) }}
-                            title={`Sensor: ${row.label}\nTime bucket: ${bucketLabel}\nAverage: ${cell.averageValue === null ? "N/A" : cell.averageValue.toFixed(2)}\nSamples: ${cell.sampleCount}`}
-                            onMouseEnter={() =>
-                              setHoveredHeatmapCell({
-                                sensorLabel: row.label,
-                                bucketLabel,
-                                averageValue: cell.averageValue,
-                                sampleCount: cell.sampleCount,
-                              })
-                            }
-                            onFocus={() =>
-                              setHoveredHeatmapCell({
-                                sensorLabel: row.label,
-                                bucketLabel,
-                                averageValue: cell.averageValue,
-                                sampleCount: cell.sampleCount,
-                              })
-                            }
-                            onMouseLeave={() => setHoveredHeatmapCell(null)}
-                            onBlur={() => setHoveredHeatmapCell(null)}
-                            aria-label={`${row.label} ${bucketLabel} average ${cell.averageValue === null ? "N/A" : cell.averageValue.toFixed(2)} samples ${cell.sampleCount}`}
-                          />
-                        );
-                      })}
-                    </div>
+              {(heatmapViewMode === "grid" || heatmapViewMode === "compact") && (
+                <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                  <div className="min-w-[900px] space-y-2">
+                    {heatmapAnalysis.sensorRows.map((row) => (
+                      <div key={row.key} className="grid items-center gap-2" style={{ gridTemplateColumns: `11rem repeat(${heatmapAnalysis.bucketCount}, minmax(0, 1fr))` }}>
+                        <div className="pr-2 text-xs font-medium text-slate-300">{row.label}</div>
+                        {heatmapAnalysis.cellsBySensor[row.key].map((cell) => {
+                          const bucketLabel =
+                            `${formatTickLabel(cell.bucketStartMs, timeUnit)} - ${formatTickLabel(cell.bucketEndMs, timeUnit)}`;
+                          return (
+                            <button
+                              key={`${row.key}-${cell.bucketIndex}`}
+                              type="button"
+                              className={`${heatmapViewMode === "compact" ? "h-4" : "h-7"} rounded-sm border border-slate-900/70 transition hover:scale-[1.02]`}
+                              style={{ backgroundColor: heatmapColorFromNormalized(cell.normalizedValue) }}
+                              title={`Sensor: ${row.label}\nTime bucket: ${bucketLabel}\nAverage: ${cell.averageValue === null ? "N/A" : cell.averageValue.toFixed(2)}\nSamples: ${cell.sampleCount}`}
+                              onMouseEnter={() =>
+                                setHoveredHeatmapCell({
+                                  sensorLabel: row.label,
+                                  bucketLabel,
+                                  averageValue: cell.averageValue,
+                                  sampleCount: cell.sampleCount,
+                                })
+                              }
+                              onFocus={() =>
+                                setHoveredHeatmapCell({
+                                  sensorLabel: row.label,
+                                  bucketLabel,
+                                  averageValue: cell.averageValue,
+                                  sampleCount: cell.sampleCount,
+                                })
+                              }
+                              onMouseLeave={() => setHoveredHeatmapCell(null)}
+                              onBlur={() => setHoveredHeatmapCell(null)}
+                              aria-label={`${row.label} ${bucketLabel} average ${cell.averageValue === null ? "N/A" : cell.averageValue.toFixed(2)} samples ${cell.sampleCount}`}
+                            />
+                          );
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {heatmapViewMode === "stripes" && (
+                <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                  <div className="min-w-[900px] space-y-3">
+                    {heatmapAnalysis.sensorRows.map((row) => (
+                      <div key={row.key} className="space-y-1">
+                        <p className="text-[11px] text-slate-400">{row.label}</p>
+                        <div className="grid gap-0.5" style={{ gridTemplateColumns: `repeat(${heatmapAnalysis.bucketCount}, minmax(0, 1fr))` }}>
+                          {heatmapAnalysis.cellsBySensor[row.key].map((cell) => {
+                            const bucketLabel =
+                              `${formatTickLabel(cell.bucketStartMs, timeUnit)} - ${formatTickLabel(cell.bucketEndMs, timeUnit)}`;
+                            return (
+                              <button
+                                key={`${row.key}-stripe-${cell.bucketIndex}`}
+                                type="button"
+                                className="h-6 rounded-[2px] border border-slate-900/60"
+                                style={{ backgroundColor: heatmapColorFromNormalized(cell.normalizedValue) }}
+                                title={`Sensor: ${row.label}\nTime bucket: ${bucketLabel}\nAverage: ${cell.averageValue === null ? "N/A" : cell.averageValue.toFixed(2)}\nSamples: ${cell.sampleCount}`}
+                                onMouseEnter={() =>
+                                  setHoveredHeatmapCell({
+                                    sensorLabel: row.label,
+                                    bucketLabel,
+                                    averageValue: cell.averageValue,
+                                    sampleCount: cell.sampleCount,
+                                  })
+                                }
+                                onMouseLeave={() => setHoveredHeatmapCell(null)}
+                                onFocus={() =>
+                                  setHoveredHeatmapCell({
+                                    sensorLabel: row.label,
+                                    bucketLabel,
+                                    averageValue: cell.averageValue,
+                                    sampleCount: cell.sampleCount,
+                                  })
+                                }
+                                onBlur={() => setHoveredHeatmapCell(null)}
+                              />
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {heatmapViewMode === "table" && (
+                <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/40">
+                  <table className="min-w-[900px] text-xs">
+                    <thead className="bg-slate-950/80 text-slate-400">
+                      <tr className="border-b border-slate-800">
+                        <th className="px-3 py-2 text-left font-medium">Sensor</th>
+                        {Array.from({ length: heatmapAnalysis.bucketCount }, (_, index) => (
+                          <th key={`bucket-head-${index}`} className="px-2 py-2 text-center font-medium">
+                            B{index + 1}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {heatmapAnalysis.sensorRows.map((row) => (
+                        <tr key={`table-${row.key}`} className="border-b border-slate-800/70">
+                          <td className="whitespace-nowrap px-3 py-2 font-medium text-slate-200">{row.label}</td>
+                          {heatmapAnalysis.cellsBySensor[row.key].map((cell) => {
+                            const bucketLabel =
+                              `${formatTickLabel(cell.bucketStartMs, timeUnit)} - ${formatTickLabel(cell.bucketEndMs, timeUnit)}`;
+                            return (
+                              <td key={`table-${row.key}-${cell.bucketIndex}`} className="px-1.5 py-1.5">
+                                <button
+                                  type="button"
+                                  className="w-full rounded border border-slate-900/70 px-1 py-1 text-center"
+                                  style={{ backgroundColor: heatmapColorFromNormalized(cell.normalizedValue) }}
+                                  title={`Sensor: ${row.label}\nTime bucket: ${bucketLabel}\nAverage: ${cell.averageValue === null ? "N/A" : cell.averageValue.toFixed(2)}\nSamples: ${cell.sampleCount}`}
+                                  onMouseEnter={() =>
+                                    setHoveredHeatmapCell({
+                                      sensorLabel: row.label,
+                                      bucketLabel,
+                                      averageValue: cell.averageValue,
+                                      sampleCount: cell.sampleCount,
+                                    })
+                                  }
+                                  onMouseLeave={() => setHoveredHeatmapCell(null)}
+                                  onFocus={() =>
+                                    setHoveredHeatmapCell({
+                                      sensorLabel: row.label,
+                                      bucketLabel,
+                                      averageValue: cell.averageValue,
+                                      sampleCount: cell.sampleCount,
+                                    })
+                                  }
+                                  onBlur={() => setHoveredHeatmapCell(null)}
+                                >
+                                  <p className="font-mono text-[10px] text-slate-100">
+                                    {cell.averageValue === null ? "N/A" : cell.averageValue.toFixed(1)}
+                                  </p>
+                                  <p className="text-[10px] text-slate-200/90">n={cell.sampleCount}</p>
+                                </button>
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {heatmapViewMode === "intensity-cards" && (
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  {heatmapIntensityCards.map((card) => (
+                    <article key={`intensity-${card.key}`} className="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <h3 className="text-sm font-semibold text-slate-200">{card.label}</h3>
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                            card.variationLevel === "High"
+                              ? "bg-red-500/20 text-red-300"
+                              : card.variationLevel === "Medium"
+                                ? "bg-amber-500/20 text-amber-300"
+                                : "bg-emerald-500/20 text-emerald-300"
+                          }`}
+                        >
+                          Variation {card.variationLevel}
+                        </span>
+                      </div>
+
+                      <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
+                        <div className="rounded border border-slate-800 bg-slate-950 px-2 py-1.5">
+                          <p className="text-slate-500">Min</p>
+                          <p className="font-mono text-slate-200">{card.min === null ? "N/A" : card.min.toFixed(2)}</p>
+                        </div>
+                        <div className="rounded border border-slate-800 bg-slate-950 px-2 py-1.5">
+                          <p className="text-slate-500">Avg</p>
+                          <p className="font-mono text-slate-200">{card.avg === null ? "N/A" : card.avg.toFixed(2)}</p>
+                        </div>
+                        <div className="rounded border border-slate-800 bg-slate-950 px-2 py-1.5">
+                          <p className="text-slate-500">Max</p>
+                          <p className="font-mono text-slate-200">{card.max === null ? "N/A" : card.max.toFixed(2)}</p>
+                        </div>
+                      </div>
+
+                      <div className="mt-2 grid gap-0.5" style={{ gridTemplateColumns: `repeat(${heatmapAnalysis.bucketCount}, minmax(0, 1fr))` }}>
+                        {card.cells.map((cell) => {
+                          const bucketLabel =
+                            `${formatTickLabel(cell.bucketStartMs, timeUnit)} - ${formatTickLabel(cell.bucketEndMs, timeUnit)}`;
+                          return (
+                            <button
+                              key={`card-cell-${card.key}-${cell.bucketIndex}`}
+                              type="button"
+                              className="h-4 rounded-[2px] border border-slate-900/60"
+                              style={{ backgroundColor: heatmapColorFromNormalized(cell.normalizedValue) }}
+                              title={`Sensor: ${card.label}\nTime bucket: ${bucketLabel}\nAverage: ${cell.averageValue === null ? "N/A" : cell.averageValue.toFixed(2)}\nSamples: ${cell.sampleCount}`}
+                              onMouseEnter={() =>
+                                setHoveredHeatmapCell({
+                                  sensorLabel: card.label,
+                                  bucketLabel,
+                                  averageValue: cell.averageValue,
+                                  sampleCount: cell.sampleCount,
+                                })
+                              }
+                              onMouseLeave={() => setHoveredHeatmapCell(null)}
+                              onFocus={() =>
+                                setHoveredHeatmapCell({
+                                  sensorLabel: card.label,
+                                  bucketLabel,
+                                  averageValue: cell.averageValue,
+                                  sampleCount: cell.sampleCount,
+                                })
+                              }
+                              onBlur={() => setHoveredHeatmapCell(null)}
+                            />
+                          );
+                        })}
+                      </div>
+                    </article>
                   ))}
                 </div>
-              </div>
+              )}
 
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
                 <div className="flex items-center gap-2 text-xs text-slate-300">
