@@ -3,8 +3,13 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
+  BarChart3,
+  ClipboardCheck,
+  Clock3,
   Gauge,
+  ScanSearch,
   Thermometer,
+  TrendingUp,
   Waves,
   Ruler,
   Activity,
@@ -330,6 +335,15 @@ function calculatePearsonCoefficient(seriesX: number[], seriesY: number[]): numb
 
   const coefficient = numerator / denominator;
   return Number.isFinite(coefficient) ? Math.max(-1, Math.min(1, coefficient)) : null;
+}
+
+function getCorrelationRelationship(coefficient: number | null): string {
+  if (coefficient === null) return "Insufficient Data";
+  if (coefficient >= 0.7) return "Strong Positive";
+  if (coefficient >= 0.3) return "Moderate Positive";
+  if (coefficient <= -0.7) return "Strong Negative";
+  if (coefficient <= -0.3) return "Moderate Negative";
+  return "Weak / No Relationship";
 }
 
 function lowerBoundByTime(points: TimeValuePoint[], targetTimeMs: number): number {
@@ -1509,87 +1523,87 @@ export default function Home() {
   }, [allSuddenJumps, latestDistance, latestPressure, sensorOptions.length, windowedNumericRecords]);
 
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-100">
-      <div className="mx-auto max-w-7xl space-y-6 px-4 py-8 sm:px-6 lg:px-8">
-        <header className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
+    <main className="min-h-screen bg-slate-100 text-slate-900">
+      <div className="mx-auto max-w-7xl space-y-8 px-4 py-10 sm:px-6 lg:px-8">
+        <header className="rounded-2xl bg-white p-7 shadow-sm ring-1 ring-slate-200">
           <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
             Engineering Decision Support Dashboard
           </h1>
-          <p className="mt-2 text-sm text-slate-400 sm:text-base">
+          <p className="mt-2 text-sm text-slate-600 sm:text-base">
             Operational telemetry summary for robot health and action prioritization
           </p>
 
           {dataLoadMessage && (
-            <div className="mt-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
+            <div className="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
               {dataLoadMessage}
             </div>
           )}
 
           {dataSource === "demo" && !dataLoadMessage && (
-            <div className="mt-4 rounded-lg border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-sm text-sky-100">
+            <div className="mt-4 rounded-lg border border-sky-300 bg-sky-50 px-3 py-2 text-sm text-sky-900">
               Showing sanitized demo telemetry data.
             </div>
           )}
         </header>
 
-        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Executive Summary</p>
-          <div className="mt-3 grid gap-4 lg:grid-cols-3">
-            <article className="rounded-xl border border-slate-800 bg-slate-950/50 p-4 lg:col-span-2">
-              <p className="text-sm text-slate-400">Robot Health Score</p>
-              <p className="mt-2 text-4xl font-semibold text-slate-100">
+        <section className="rounded-2xl bg-white p-7 shadow-sm ring-1 ring-slate-200">
+          <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">Executive Summary</p>
+          <div className="mt-5 grid gap-5 lg:grid-cols-3">
+            <article className="rounded-2xl bg-slate-50 p-6 ring-1 ring-slate-200 lg:col-span-2">
+              <p className="text-sm font-medium text-slate-600">Robot Health Score</p>
+              <p className="mt-2 text-5xl font-bold tracking-tight text-slate-900">
                 Robot Health Score: {engineeringDecision.healthScore}/100
               </p>
               <span
-                className={`mt-3 inline-flex rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wide ${
+                className={`mt-4 inline-flex rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wide ${
                   engineeringDecision.healthStatus === "Excellent"
-                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+                    ? "border-emerald-300 bg-emerald-50 text-emerald-800"
                     : engineeringDecision.healthStatus === "Good"
-                      ? "border-sky-500/40 bg-sky-500/10 text-sky-200"
+                      ? "border-sky-300 bg-sky-50 text-sky-800"
                       : engineeringDecision.healthStatus === "Warning"
-                        ? "border-amber-500/40 bg-amber-500/10 text-amber-200"
-                        : "border-red-500/40 bg-red-500/10 text-red-200"
+                        ? "border-amber-300 bg-amber-50 text-amber-800"
+                        : "border-rose-300 bg-rose-50 text-rose-800"
                 }`}
               >
                 {engineeringDecision.healthStatus}
               </span>
             </article>
 
-            <article className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
-              <p className="text-[11px] uppercase tracking-wide text-slate-500">Window Summary</p>
+            <article className="rounded-2xl bg-slate-50 p-6 ring-1 ring-slate-200">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Window Summary</p>
               <div className="mt-2 space-y-2 text-sm">
-                <p className="flex items-center justify-between"><span className="text-slate-400">Time Window</span><span className="font-semibold text-slate-200">{selectedTimeWindowLabel}</span></p>
-                <p className="flex items-center justify-between"><span className="text-slate-400">Sensor Points</span><span className="font-semibold text-slate-200">{windowedNumericRecords.length}</span></p>
-                <p className="flex items-center justify-between"><span className="text-slate-400">Warnings</span><span className="font-semibold text-slate-200">{allSuddenJumps.length}</span></p>
-                <p className="flex items-center justify-between"><span className="text-slate-400">Active Sensors</span><span className="font-semibold text-slate-200">{sensorOptions.length}</span></p>
+                <p className="flex items-center justify-between"><span className="text-slate-600">Time Window</span><span className="font-semibold text-slate-900">{selectedTimeWindowLabel}</span></p>
+                <p className="flex items-center justify-between"><span className="text-slate-600">Sensor Points</span><span className="font-semibold text-slate-900">{windowedNumericRecords.length}</span></p>
+                <p className="flex items-center justify-between"><span className="text-slate-600">Warnings</span><span className="font-semibold text-slate-900">{allSuddenJumps.length}</span></p>
+                <p className="flex items-center justify-between"><span className="text-slate-600">Active Sensors</span><span className="font-semibold text-slate-900">{sensorOptions.length}</span></p>
               </div>
             </article>
           </div>
         </section>
 
-        <section className="grid gap-4 lg:grid-cols-2">
-          <article className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
-            <p className="text-xs uppercase tracking-wide text-slate-500">System Status</p>
-            <p className="mt-2 text-2xl font-semibold text-slate-100">
+        <section className="grid gap-5 lg:grid-cols-2">
+          <article className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+            <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">System Status</p>
+            <p className="mt-2 text-3xl font-semibold text-slate-900">
               {engineeringDecision.systemStatus.icon} {engineeringDecision.systemStatus.label}
             </p>
-            <ul className="mt-4 space-y-2 text-sm text-slate-300">
+            <ul className="mt-4 space-y-3 text-sm text-slate-700">
               {engineeringDecision.topIssues.map((issue, index) => (
                 <li key={`${issue.text}-${index}`} className="flex items-start gap-2">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 text-slate-400" />
+                  <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-600" />
                   <span>{issue.text}</span>
                 </li>
               ))}
             </ul>
           </article>
 
-          <article className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
-            <p className="text-xs uppercase tracking-wide text-slate-500">Key Changes In Current Window</p>
-            <div className="mt-3 space-y-2">
+          <article className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+            <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">Key Changes In Current Window</p>
+            <div className="mt-4 space-y-2.5">
               {keyChanges.map((change) => (
-                <div key={change.key} className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2 text-sm">
-                  <span className="text-slate-300">{change.label}</span>
-                  <span className="font-semibold text-slate-100">
+                <div key={change.key} className="flex items-center justify-between rounded-xl bg-slate-50 px-4 py-3 text-sm ring-1 ring-slate-200">
+                  <span className="text-slate-700">{change.label}</span>
+                  <span className="font-semibold text-slate-900">
                     {change.direction.arrow} {change.deltaPct === null ? "N/A" : `${change.deltaPct >= 0 ? "+" : ""}${change.deltaPct.toFixed(1)}%`}
                   </span>
                 </div>
@@ -1598,21 +1612,21 @@ export default function Home() {
           </article>
         </section>
 
-        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Sensor Overview</p>
-          <div className="mt-3 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+        <section className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+          <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">Sensor Overview</p>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
             {metricCards.map((card) => {
               const Icon = card.icon;
               return (
-                <article key={card.title} className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
+                <article key={card.title} className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
                   <div className="flex items-center justify-between">
-                    <p className="text-sm text-slate-400">{card.title}</p>
-                    <Icon className="h-4 w-4 text-slate-500" />
+                    <p className="text-sm font-medium text-slate-600">{card.title}</p>
+                    <Icon className="h-5 w-5 text-sky-700" />
                   </div>
-                  <p className="mt-2 text-2xl font-semibold text-slate-100">
+                  <p className="mt-3 text-3xl font-semibold text-slate-900">
                     {card.latest === null ? "N/A" : `${card.latest.toFixed(2)} ${card.unit}`}
                   </p>
-                  <p className="mt-1 text-sm text-slate-300">
+                  <p className="mt-2 text-sm font-medium text-slate-700">
                     {card.trendArrow} {card.trendLabel}
                   </p>
                 </article>
@@ -1621,15 +1635,15 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Trend Graph</p>
-          <div className="mt-4 grid gap-4 lg:grid-cols-4">
-            <article className="rounded-xl border border-slate-800 bg-slate-950/50 p-4 lg:col-span-3">
-              <div className="mb-4 flex flex-wrap items-center gap-2">
+        <section className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+          <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">Trend Graph</p>
+          <div className="mt-4 grid gap-5 lg:grid-cols-4">
+            <article className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 lg:col-span-3">
+              <div className="mb-5 flex flex-wrap items-center gap-3">
                 <select
                   value={selectedSensor}
                   onChange={(event) => setSelectedSensor(event.target.value)}
-                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-slate-500"
+                  className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
                 >
                   {sensorOptions.map((sensor) => (
                     <option key={sensor} value={sensor}>
@@ -1645,7 +1659,7 @@ export default function Home() {
                   value={timeAmount}
                   onChange={(event) => setTimeAmount(event.target.value)}
                   disabled={timeUnit === "all"}
-                  className="w-24 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  className="w-24 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500"
                   placeholder="Amount"
                   aria-label="Time amount"
                 />
@@ -1653,7 +1667,7 @@ export default function Home() {
                 <select
                   value={timeUnit}
                   onChange={(event) => setTimeUnit(event.target.value as TimeUnit)}
-                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-slate-500"
+                  className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
                   aria-label="Time unit"
                 >
                   <option value="seconds">seconds</option>
@@ -1664,14 +1678,14 @@ export default function Home() {
                 </select>
               </div>
 
-              <div className="mb-3 rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-1.5 font-mono text-[11px] text-slate-400">
+              <div className="mb-4 rounded-xl bg-slate-50 px-3 py-2 font-mono text-[11px] text-slate-600 ring-1 ring-slate-200">
                 Sensor = {selectedSensor}&nbsp;&nbsp;|&nbsp;&nbsp;Points = {selectedSeries.length}&nbsp;&nbsp;|&nbsp;&nbsp;Time Range = {timeUnit === "all" ? "all" : `${timeAmount} ${timeUnit}`}
               </div>
 
               <div className="h-80 w-full">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={selectedSeries}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                    <CartesianGrid strokeDasharray="3 3" stroke="#cbd5e1" />
                     <XAxis
                       dataKey="timeMs"
                       type="number"
@@ -1679,10 +1693,10 @@ export default function Home() {
                       domain={["dataMin", "dataMax"]}
                       tickCount={xAxisTickCount}
                       tickFormatter={(v: number) => formatTickLabel(v, timeUnit)}
-                      tick={{ fill: "#94a3b8", fontSize: 11 }}
+                      tick={{ fill: "#475569", fontSize: 11 }}
                       minTickGap={40}
                     />
-                    <YAxis tick={{ fill: "#94a3b8", fontSize: 11 }} width={50} />
+                    <YAxis tick={{ fill: "#475569", fontSize: 11 }} width={50} />
                     <Tooltip
                       labelFormatter={(label) => {
                         const timeMs =
@@ -1696,16 +1710,16 @@ export default function Home() {
                           : String(label ?? "");
                       }}
                       contentStyle={{
-                        backgroundColor: "#020617",
-                        border: "1px solid #334155",
+                        backgroundColor: "#ffffff",
+                        border: "1px solid #cbd5e1",
                         borderRadius: "0.5rem",
-                        color: "#e2e8f0",
+                        color: "#0f172a",
                       }}
                     />
                     <Line
                       type="monotone"
                       dataKey="value"
-                      stroke="#34d399"
+                      stroke="#2563eb"
                       strokeWidth={2.2}
                       dot={false}
                       activeDot={{ r: 4 }}
@@ -1716,31 +1730,31 @@ export default function Home() {
               </div>
             </article>
 
-            <aside className="rounded-xl border border-slate-800 bg-slate-950/50 p-4">
-              <h3 className="text-base font-medium text-slate-200">Current Chart Statistics</h3>
-              <p className="mt-1 text-xs text-slate-500">Computed from visible points in the active chart window</p>
+            <aside className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+              <h3 className="text-base font-medium text-slate-900">Current Chart Statistics</h3>
+              <p className="mt-1 text-xs text-slate-600">Computed from visible points in the active chart window</p>
               <div className="mt-3 space-y-2">
-                <div className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
+                <div className="rounded-xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200">
                   <p className="text-[11px] uppercase tracking-wide text-slate-500">Min</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-200">
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
                     {chartStats.min === null ? "No data" : chartStats.min.toFixed(2)}
                   </p>
                 </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
+                <div className="rounded-xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200">
                   <p className="text-[11px] uppercase tracking-wide text-slate-500">Max</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-200">
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
                     {chartStats.max === null ? "No data" : chartStats.max.toFixed(2)}
                   </p>
                 </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
+                <div className="rounded-xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200">
                   <p className="text-[11px] uppercase tracking-wide text-slate-500">Average</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-200">
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
                     {chartStats.avg === null ? "No data" : chartStats.avg.toFixed(2)}
                   </p>
                 </div>
-                <div className="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
+                <div className="rounded-xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200">
                   <p className="text-[11px] uppercase tracking-wide text-slate-500">Points</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-200">
+                  <p className="mt-1 text-sm font-semibold text-slate-900">
                     {chartStats.points === 0 ? "No data" : chartStats.points}
                   </p>
                 </div>
@@ -1749,10 +1763,134 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">AI Recommendation</p>
-          <p className="mt-2 text-lg font-medium text-slate-100">{engineeringDecision.recommendation}</p>
-          <p className="mt-1 text-sm text-slate-400">Confidence: {aiAnalysis.confidence}%</p>
+        <section className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+          <div className="max-w-3xl">
+            <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+              Sensor Relationship Analysis
+            </p>
+            <p className="mt-2 text-sm text-slate-600">
+              Correlation helps identify whether changes in one sensor are related to changes in another.
+            </p>
+          </div>
+
+          <div className="mt-5 overflow-hidden rounded-xl ring-1 ring-slate-200">
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
+                <thead className="bg-slate-50">
+                  <tr>
+                    <th className="px-4 py-3 font-semibold text-slate-700" scope="col">
+                      Sensor Pair
+                    </th>
+                    <th className="px-4 py-3 font-semibold text-slate-700" scope="col">
+                      Correlation
+                    </th>
+                    <th className="px-4 py-3 font-semibold text-slate-700" scope="col">
+                      Relationship
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 bg-white">
+                  {[
+                    { left: "temperature", right: "humidity" },
+                    { left: "temperature", right: "pressure" },
+                    { left: "distance", right: "accel" },
+                    { left: "humidity", right: "pressure" },
+                  ].map((pair) => {
+                    const left = pair.left as ComparisonSensorKey;
+                    const right = pair.right as ComparisonSensorKey;
+                    const coefficient = correlationAnalysis.coefficientMatrix[left][right];
+
+                    return (
+                      <tr key={`${left}-${right}`}>
+                        <td className="px-4 py-4 font-medium text-slate-900">
+                          {correlationSensorLabelByKey[left]} and {correlationSensorLabelByKey[right]}
+                        </td>
+                        <td className="px-4 py-4 font-mono font-semibold tabular-nums text-slate-900">
+                          {coefficient === null
+                            ? "N/A"
+                            : `${coefficient >= 0 ? "+" : ""}${coefficient.toFixed(2)}`}
+                        </td>
+                        <td className="px-4 py-4 text-slate-700">
+                          {getCorrelationRelationship(coefficient)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+          <div className="max-w-3xl">
+            <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+              Research Methods Used
+            </p>
+            <p className="mt-2 text-sm text-slate-600">
+              Scientific methods applied to the selected telemetry and decision-support outputs.
+            </p>
+          </div>
+
+          <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+            {[
+              {
+                title: "Descriptive Statistics",
+                description:
+                  "Min, Max, Average and Sample Count are calculated from the currently selected sensor and time window.",
+                icon: BarChart3,
+              },
+              {
+                title: "Time Series Analysis",
+                description:
+                  "Sensor behavior is analyzed over time to identify trends and changes.",
+                icon: Clock3,
+              },
+              {
+                title: "Trend Detection",
+                description:
+                  "Sensors are classified as Rising, Falling or Stable using recent observations.",
+                icon: TrendingUp,
+              },
+              {
+                title: "Anomaly Detection",
+                description:
+                  "Sudden jumps between consecutive readings are automatically detected and ranked.",
+                icon: ScanSearch,
+              },
+              {
+                title: "Decision Support",
+                description:
+                  "Robot Health Score and Recommended Action summarize system status.",
+                icon: ClipboardCheck,
+              },
+            ].map((method) => {
+              const Icon = method.icon;
+
+              return (
+                <article
+                  key={method.title}
+                  className="rounded-2xl bg-white p-5 ring-1 ring-slate-200"
+                >
+                  <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-100 ring-1 ring-slate-200">
+                    <Icon className="h-4 w-4 text-sky-700" aria-hidden="true" />
+                  </div>
+                  <h3 className="mt-4 text-sm font-semibold text-slate-900">
+                    {method.title}
+                  </h3>
+                  <p className="mt-2 text-sm leading-6 text-slate-600">
+                    {method.description}
+                  </p>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+          <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">Recommended Action</p>
+          <p className="mt-2 text-xl font-semibold text-slate-900">{engineeringDecision.recommendation}</p>
+          <p className="mt-2 text-sm text-slate-600">Confidence: {aiAnalysis.confidence}%</p>
         </section>
       </div>
     </main>
