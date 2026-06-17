@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import {
   CartesianGrid,
+  Legend,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -50,6 +51,11 @@ type DataSource = "demo" | "local" | null;
 type ComparisonSensorKey = "temperature" | "humidity" | "pressure" | "distance" | "accel";
 type ComparisonScaleMode = "raw" | "normalized";
 type ComparisonPoint = { timeMs: number } & Partial<Record<ComparisonSensorKey, number>>;
+type MainChartPoint = {
+  timeMs: number;
+  primaryValue?: number;
+  forecastValue?: number;
+} & Record<string, number | undefined>;
 
 type ComparisonSensorDefinition = {
   key: ComparisonSensorKey;
@@ -346,6 +352,155 @@ function getCorrelationRelationship(coefficient: number | null): string {
   return "Weak / No Relationship";
 }
 
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+}
+
+function getTypicalTimeStep(points: TimeValuePoint[]): number {
+  const gaps = points
+    .slice(1)
+    .map((point, index) => point.timeMs - points[index].timeMs)
+    .filter((gap) => Number.isFinite(gap) && gap > 0);
+
+  return median(gaps) || 60 * 1000;
+}
+
+function gaussianWeightedAverage(points: TimeValuePoint[], targetTimeMs: number, sigma: number): number | null {
+  if (points.length === 0 || sigma <= 0) return null;
+
+  let weightedSum = 0;
+  let weightTotal = 0;
+
+  for (const point of points) {
+    const timeDistance = targetTimeMs - point.timeMs;
+    const weight = Math.exp(-(timeDistance ** 2) / (2 * sigma ** 2));
+    weightedSum += point.value * weight;
+    weightTotal += weight;
+  }
+
+  return weightTotal === 0 ? null : weightedSum / weightTotal;
+}
+
+function getGaussianSigma(points: TimeValuePoint[]): number {
+  if (points.length < 2) return 60 * 1000;
+
+  const span = points[points.length - 1].timeMs - points[0].timeMs;
+  const typicalStep = getTypicalTimeStep(points);
+  return Math.max(typicalStep * 3, span / 2, 60 * 1000);
+}
+
+function calculateGaussianForecast(points: TimeValuePoint[]): { value: number | null; direction: string } {
+  if (points.length < 3) {
+    return { value: null, direction: "Insufficient data" };
+  }
+
+  const sorted = [...points].sort((a, b) => a.timeMs - b.timeMs);
+  const newest = sorted[sorted.length - 1];
+  const forecast = gaussianWeightedAverage(sorted, newest.timeMs, getGaussianSigma(sorted));
+
+  if (forecast === null) {
+    return { value: null, direction: "Insufficient data" };
+  }
+
+  const threshold = Math.max(Math.abs(newest.value) * 0.01, 0.05);
+  const direction =
+    forecast > newest.value + threshold
+      ? "Rising"
+      : forecast < newest.value - threshold
+        ? "Falling"
+        : "Stable";
+
+  return { value: forecast, direction };
+}
+
+function generateGaussianForecastPoints(points: TimeValuePoint[], count = 10): TimeValuePoint[] {
+  if (points.length < 3) return [];
+
+  const history = [...points].sort((a, b) => a.timeMs - b.timeMs);
+  const stepMs = getTypicalTimeStep(history);
+  const forecastPoints: TimeValuePoint[] = [];
+
+  for (let i = 0; i < count; i += 1) {
+    const targetTimeMs = history[history.length - 1].timeMs + stepMs;
+    const sigma = getGaussianSigma(history);
+    const weightedAverage = gaussianWeightedAverage(history, targetTimeMs, sigma);
+
+    if (weightedAverage === null) break;
+
+    const recent = history.slice(-Math.min(5, history.length));
+    const firstRecent = recent[0];
+    const lastRecent = recent[recent.length - 1];
+    const trendPerMs =
+      lastRecent.timeMs === firstRecent.timeMs
+        ? 0
+        : (lastRecent.value - firstRecent.value) / (lastRecent.timeMs - firstRecent.timeMs);
+    const forecastValue = weightedAverage + trendPerMs * stepMs * 0.35;
+    const forecastPoint = { timeMs: targetTimeMs, value: forecastValue };
+
+    forecastPoints.push(forecastPoint);
+    history.push(forecastPoint);
+  }
+
+  return forecastPoints;
+}
+
+function normalizeValue(value: number, min: number, max: number): number {
+  if (max === min) return 50;
+  return ((value - min) / (max - min)) * 100;
+}
+
+function calculateStability(points: TimeValuePoint[]): { score: number | null; label: string } {
+  if (points.length < 2) {
+    return { score: null, label: "Insufficient data" };
+  }
+
+  const values = points.map((point) => point.value);
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const variance =
+    values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
+  const standardDeviation = Math.sqrt(variance);
+  const fluctuationRatio = Math.abs(mean) > 0.001
+    ? standardDeviation / Math.abs(mean)
+    : standardDeviation;
+
+  const jumpCount = points.slice(1).filter((point, index) => {
+    const previous = points[index];
+    if (previous.value === 0) return Math.abs(point.value) > 0.05;
+    return Math.abs(point.value - previous.value) / Math.abs(previous.value) >= 0.2;
+  }).length;
+
+  const recent = points.slice(-Math.min(6, points.length));
+  const recentDeltas = recent
+    .slice(1)
+    .map((point, index) => Math.abs(point.value - recent[index].value));
+  const recentNoise =
+    recentDeltas.length === 0
+      ? 0
+      : recentDeltas.reduce((sum, value) => sum + value, 0) / recentDeltas.length;
+  const valueRange = Math.max(...values) - Math.min(...values);
+  const noiseRatio = valueRange > 0 ? recentNoise / valueRange : 0;
+
+  const score = clamp(
+    Math.round(
+      100 -
+        Math.min(35, jumpCount * 8) -
+        Math.min(35, fluctuationRatio * 100) -
+        Math.min(30, noiseRatio * 60),
+    ),
+    0,
+    100,
+  );
+
+  const label = score >= 85 ? "Stable" : score >= 60 ? "Moderate" : "Unstable";
+  return { score, label };
+}
+
 function lowerBoundByTime(points: TimeValuePoint[], targetTimeMs: number): number {
   let left = 0;
   let right = points.length;
@@ -449,6 +604,9 @@ export default function Home() {
   const [anomalySeverityFilter, setAnomalySeverityFilter] = useState<AnomalySeverityFilter>("All");
   const [hoveredHeatmapCell, setHoveredHeatmapCell] = useState<HeatmapHoverInfo | null>(null);
   const [heatmapViewMode, setHeatmapViewMode] = useState<HeatmapViewMode>("grid");
+  const [selectedOverlaySensors, setSelectedOverlaySensors] = useState<ComparisonSensorKey[]>([]);
+  const [normalizeOverlay, setNormalizeOverlay] = useState(false);
+  const [showFuturePrediction, setShowFuturePrediction] = useState(false);
 
   useEffect(() => {
     let isCancelled = false;
@@ -624,6 +782,162 @@ export default function Home() {
       points: values.length,
     };
   }, [selectedSeries]);
+
+  const primaryComparisonSensor = useMemo(() => {
+    return COMPARISON_SENSOR_DEFINITIONS.find((sensorDef) =>
+      sensorDef.aliases.includes(selectedSensor),
+    ) ?? null;
+  }, [selectedSensor]);
+
+  const mainChartSensorDefinitions = useMemo(() => {
+    const sensorMap = new Map<ComparisonSensorKey, ComparisonSensorDefinition>();
+
+    if (primaryComparisonSensor) {
+      sensorMap.set(primaryComparisonSensor.key, primaryComparisonSensor);
+    }
+
+    for (const sensorKey of selectedOverlaySensors) {
+      const definition = COMPARISON_SENSOR_DEFINITIONS.find((sensorDef) => sensorDef.key === sensorKey);
+      if (definition) {
+        sensorMap.set(sensorKey, definition);
+      }
+    }
+
+    return Array.from(sensorMap.values());
+  }, [primaryComparisonSensor, selectedOverlaySensors]);
+
+  const selectedSeriesValueRange = useMemo(() => {
+    const values = selectedSeries.map((point) => point.value);
+    return values.length === 0
+      ? null
+      : { min: Math.min(...values), max: Math.max(...values) };
+  }, [selectedSeries]);
+
+  const futurePredictionSeries = useMemo(() => {
+    return showFuturePrediction
+      ? generateGaussianForecastPoints(selectedSeries, 10)
+      : [];
+  }, [selectedSeries, showFuturePrediction]);
+
+  const mainChartData = useMemo<MainChartPoint[]>(() => {
+    const primaryTimeline = selectedSeries.length > 0
+      ? selectedSeries
+      : windowedNumericRecords
+          .map((record) => ({ timeMs: record.timeMs, value: record.value }))
+          .sort((a, b) => a.timeMs - b.timeMs);
+
+    if (primaryTimeline.length === 0) {
+      return [];
+    }
+
+    const byTime = new Map<number, MainChartPoint>(
+      primaryTimeline.map((point) => [point.timeMs, { timeMs: point.timeMs }]),
+    );
+
+    const getOrCreatePoint = (timeMs: number) => {
+      const existing = byTime.get(timeMs);
+      if (existing) return existing;
+
+      const point: MainChartPoint = { timeMs };
+      byTime.set(timeMs, point);
+      return point;
+    };
+
+    const ranges = new Map<ComparisonSensorKey | "primary", { min: number; max: number }>();
+
+    if (selectedSeriesValueRange) {
+      ranges.set("primary", selectedSeriesValueRange);
+    }
+
+    for (const sensorDef of mainChartSensorDefinitions) {
+      const values = windowedNumericRecords
+        .filter((record) => sensorDef.aliases.includes(record.sensor))
+        .map((record) => record.value);
+
+      if (values.length > 0) {
+        ranges.set(sensorDef.key, {
+          min: Math.min(...values),
+          max: Math.max(...values),
+        });
+      }
+    }
+
+    for (const point of primaryTimeline) {
+      const range = ranges.get("primary");
+      getOrCreatePoint(point.timeMs).primaryValue =
+        normalizeOverlay && range
+          ? normalizeValue(point.value, range.min, range.max)
+          : point.value;
+    }
+
+    for (const sensorDef of mainChartSensorDefinitions) {
+      if (primaryComparisonSensor?.key === sensorDef.key) {
+        continue;
+      }
+
+      const range = ranges.get(sensorDef.key);
+      const sensorSeries = windowedNumericRecords
+        .filter((record) => sensorDef.aliases.includes(record.sensor))
+        .map((record) => ({ timeMs: record.timeMs, value: record.value }))
+        .sort((a, b) => a.timeMs - b.timeMs);
+
+      if (sensorSeries.length === 0) {
+        continue;
+      }
+
+      let nearestIndex = 0;
+
+      for (const point of primaryTimeline) {
+        while (
+          nearestIndex < sensorSeries.length - 1 &&
+          Math.abs(sensorSeries[nearestIndex + 1].timeMs - point.timeMs) <=
+            Math.abs(sensorSeries[nearestIndex].timeMs - point.timeMs)
+        ) {
+          nearestIndex += 1;
+        }
+
+        const nearestValue = sensorSeries[nearestIndex].value;
+        getOrCreatePoint(point.timeMs)[`overlay_${sensorDef.key}`] =
+          normalizeOverlay && range
+            ? normalizeValue(nearestValue, range.min, range.max)
+            : nearestValue;
+      }
+    }
+
+    for (const point of futurePredictionSeries) {
+      const range = ranges.get("primary");
+      getOrCreatePoint(point.timeMs).forecastValue =
+        normalizeOverlay && range
+          ? normalizeValue(point.value, range.min, range.max)
+          : point.value;
+    }
+
+    if (futurePredictionSeries.length > 0 && selectedSeries.length > 0) {
+      const lastRealPoint = selectedSeries[selectedSeries.length - 1];
+      const range = ranges.get("primary");
+      getOrCreatePoint(lastRealPoint.timeMs).forecastValue =
+        normalizeOverlay && range
+          ? normalizeValue(lastRealPoint.value, range.min, range.max)
+          : lastRealPoint.value;
+    }
+
+    return Array.from(byTime.values()).sort((a, b) => a.timeMs - b.timeMs);
+  }, [
+    futurePredictionSeries,
+    mainChartSensorDefinitions,
+    normalizeOverlay,
+    primaryComparisonSensor,
+    selectedSeries,
+    selectedSeriesValueRange,
+    windowedNumericRecords,
+  ]);
+
+  const mainChartTickCount = useMemo(() => {
+    const n = mainChartData.length;
+    if (n <= 6) return n;
+    if (timeUnit === "seconds" || timeUnit === "minutes" || timeUnit === "hours") return 8;
+    return 7;
+  }, [mainChartData.length, timeUnit]);
 
   const selectedComparisonDefinitions = useMemo(() => {
     return COMPARISON_SENSOR_DEFINITIONS.filter((sensorDef) =>
@@ -1365,15 +1679,24 @@ export default function Home() {
 
   const metricCards = useMemo(() => {
     return sensorDefinitions.map((definition) => {
-      const values = windowedNumericRecords
+      const sensorWindowRecords = windowedNumericRecords
         .filter((record) => definition.aliases.includes(record.sensor))
-        .map((record) => record.value);
+        .sort((a, b) => a.timeMs - b.timeMs);
+      const values = sensorWindowRecords.map((record) => record.value);
+      const points = sensorWindowRecords.map((record) => ({
+        timeMs: record.timeMs,
+        value: record.value,
+      }));
+      const stability = calculateStability(points);
+      const forecast = calculateGaussianForecast(points);
 
       if (values.length < 2) {
         return {
           ...definition,
           trendArrow: "→",
           trendLabel: "Stable",
+          stability,
+          forecast,
         };
       }
 
@@ -1386,6 +1709,8 @@ export default function Home() {
         ...definition,
         trendArrow: trend.arrow,
         trendLabel: trend.label,
+        stability,
+        forecast,
       };
     });
   }, [windowedNumericRecords, latestTemperature, latestHumidity, latestPressure, latestDistance, latestAccel]);
@@ -1629,6 +1954,14 @@ export default function Home() {
                   <p className="mt-2 text-sm font-medium text-slate-700">
                     {card.trendArrow} {card.trendLabel}
                   </p>
+                  <p className="mt-2 text-xs text-slate-600">
+                    Stability: {card.stability.score === null ? "N/A" : `${card.stability.score}%`} · {card.stability.label}
+                  </p>
+                  <p className="mt-1 text-xs text-slate-600">
+                    Forecast: {card.forecast.value === null
+                      ? "Insufficient data"
+                      : `${card.forecast.value.toFixed(1)}${card.unit} · ${card.forecast.direction}`}
+                  </p>
                 </article>
               );
             })}
@@ -1676,6 +2009,62 @@ export default function Home() {
                   <option value="days">days</option>
                   <option value="all">all</option>
                 </select>
+
+                <label className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={showFuturePrediction}
+                    onChange={(event) => setShowFuturePrediction(event.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-sky-700"
+                  />
+                  Future Prediction
+                </label>
+
+                <label className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={normalizeOverlay}
+                    onChange={(event) => setNormalizeOverlay(event.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-sky-700"
+                  />
+                  Normalize overlay
+                </label>
+              </div>
+
+              <div className="mb-4 flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  Overlay sensors
+                </span>
+                {COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => (
+                  <label
+                    key={sensorDef.key}
+                    className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedOverlaySensors.includes(sensorDef.key)}
+                      onChange={(event) => {
+                        setSelectedOverlaySensors((previous) =>
+                          event.target.checked
+                            ? Array.from(new Set([...previous, sensorDef.key]))
+                            : previous.filter((key) => key !== sensorDef.key),
+                        );
+                      }}
+                      className="h-3.5 w-3.5 rounded border-slate-300 text-sky-700"
+                    />
+                    {sensorDef.label.split(" (")[0]}
+                  </label>
+                ))}
+              </div>
+
+              <div className="mb-4 space-y-1 text-xs text-slate-600">
+                <p>Use normalized overlay to compare sensor patterns across different units.</p>
+                <p>Forecast uses Gaussian weighting: recent readings influence prediction more than older readings.</p>
+                {showFuturePrediction && futurePredictionSeries.length === 0 && (
+                  <p className="font-medium text-amber-700">
+                    Future prediction requires at least 3 data points.
+                  </p>
+                )}
               </div>
 
               <div className="mb-4 rounded-xl bg-slate-50 px-3 py-2 font-mono text-[11px] text-slate-600 ring-1 ring-slate-200">
@@ -1684,19 +2073,23 @@ export default function Home() {
 
               <div className="h-80 w-full">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={selectedSeries}>
+                  <LineChart data={mainChartData}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#cbd5e1" />
                     <XAxis
                       dataKey="timeMs"
                       type="number"
                       scale="time"
                       domain={["dataMin", "dataMax"]}
-                      tickCount={xAxisTickCount}
+                      tickCount={mainChartTickCount}
                       tickFormatter={(v: number) => formatTickLabel(v, timeUnit)}
                       tick={{ fill: "#475569", fontSize: 11 }}
                       minTickGap={40}
                     />
-                    <YAxis tick={{ fill: "#475569", fontSize: 11 }} width={50} />
+                    <YAxis
+                      tick={{ fill: "#475569", fontSize: 11 }}
+                      width={50}
+                      domain={normalizeOverlay ? [0, 100] : ["auto", "auto"]}
+                    />
                     <Tooltip
                       labelFormatter={(label) => {
                         const timeMs =
@@ -1709,6 +2102,10 @@ export default function Home() {
                           ? formatTickLabel(timeMs, timeUnit)
                           : String(label ?? "");
                       }}
+                      formatter={(value, name) => [
+                        typeof value === "number" ? value.toFixed(2) : value,
+                        name,
+                      ]}
                       contentStyle={{
                         backgroundColor: "#ffffff",
                         border: "1px solid #cbd5e1",
@@ -1716,15 +2113,49 @@ export default function Home() {
                         color: "#0f172a",
                       }}
                     />
+                    <Legend verticalAlign="top" height={30} wrapperStyle={{ fontSize: 12 }} />
                     <Line
                       type="monotone"
-                      dataKey="value"
+                      dataKey="primaryValue"
+                      name={primaryComparisonSensor?.label.split(" (")[0] ?? selectedSensor}
                       stroke="#2563eb"
                       strokeWidth={2.2}
                       dot={false}
                       activeDot={{ r: 4 }}
                       isAnimationActive
+                      connectNulls={false}
                     />
+                    {mainChartSensorDefinitions
+                      .filter((sensorDef) => sensorDef.key !== primaryComparisonSensor?.key)
+                      .map((sensorDef) => (
+                        <Line
+                          key={sensorDef.key}
+                          type="monotone"
+                          dataKey={`overlay_${sensorDef.key}`}
+                          name={sensorDef.label.split(" (")[0]}
+                          stroke={sensorDef.color}
+                          strokeWidth={1.8}
+                          strokeDasharray={sensorDef.dasharray}
+                          dot={false}
+                          activeDot={{ r: 3 }}
+                          isAnimationActive
+                          connectNulls={false}
+                        />
+                      ))}
+                    {futurePredictionSeries.length > 0 && (
+                      <Line
+                        type="monotone"
+                        dataKey="forecastValue"
+                        name="Gaussian Forecast"
+                        stroke="#f59e0b"
+                        strokeWidth={2}
+                        strokeDasharray="6 4"
+                        dot={false}
+                        activeDot={{ r: 3 }}
+                        isAnimationActive
+                        connectNulls={false}
+                      />
+                    )}
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -1733,6 +2164,7 @@ export default function Home() {
             <aside className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
               <h3 className="text-base font-medium text-slate-900">Current Chart Statistics</h3>
               <p className="mt-1 text-xs text-slate-600">Computed from visible points in the active chart window</p>
+              <p className="mt-1 text-xs text-slate-500">Statistics shown for primary selected sensor.</p>
               <div className="mt-3 space-y-2">
                 <div className="rounded-xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200">
                   <p className="text-[11px] uppercase tracking-wide text-slate-500">Min</p>
