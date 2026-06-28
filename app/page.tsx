@@ -93,6 +93,58 @@ type CorrelationPairDebug = {
   maximumAlignmentDeltaSeconds: number | null;
 };
 
+type PcaComponentSummary = {
+  name: string;
+  explainedVariance: number;
+  cumulativeVariance: number;
+  topContributors: ComparisonSensorKey[];
+};
+
+type PcaDiagnostics = {
+  alignedObservations: number;
+  observationsUsed: number;
+  requiredObservations: number;
+  usableSensorCount: number;
+  sensorsUsed: ComparisonSensorKey[];
+  sensorsSkipped: ComparisonSensorKey[];
+  zeroVarianceSensors: ComparisonSensorKey[];
+  bucketSizeLabel: string;
+  failureReason: string | null;
+};
+
+type PcaAnalysisResult =
+  | {
+      status: "ok";
+      observations: number;
+      sensors: ComparisonSensorKey[];
+      components: PcaComponentSummary[];
+      diagnostics: PcaDiagnostics;
+    }
+  | {
+      status: "insufficient-observations" | "insufficient-sensors" | "failed";
+      message: string;
+      diagnostics: PcaDiagnostics;
+    };
+
+type CorrelationHeatmapCell = {
+  row: ComparisonSensorKey;
+  column: ComparisonSensorKey;
+  value: number | null;
+  observations: number;
+};
+
+type AlignedSensorObservation = {
+  bucketStartMs: number;
+  bucketEndMs: number;
+  values: Partial<Record<ComparisonSensorKey, number>>;
+};
+
+type AlignedSensorData = {
+  rows: AlignedSensorObservation[];
+  bucketSizeMs: number;
+  bucketSizeLabel: string;
+};
+
 type HeatmapCell = {
   sensorKey: ComparisonSensorKey;
   sensorLabel: string;
@@ -266,21 +318,21 @@ const COMPARISON_SENSOR_DEFINITIONS: ComparisonSensorDefinition[] = [
     label: "Temperature (temperature/temp)",
     aliases: ["temperature", "temp"],
     unit: "°C",
-    color: "#f59e0b",
+    color: "#EA580C",
   },
   {
     key: "humidity",
     label: "Humidity",
     aliases: ["humidity"],
     unit: "%",
-    color: "#38bdf8",
+    color: "#0E7490",
   },
   {
     key: "pressure",
     label: "Pressure",
     aliases: ["pressure"],
     unit: "hPa",
-    color: "#c084fc",
+    color: "#475569",
     dasharray: "5 3",
   },
   {
@@ -288,14 +340,14 @@ const COMPARISON_SENSOR_DEFINITIONS: ComparisonSensorDefinition[] = [
     label: "Distance",
     aliases: ["distance"],
     unit: "cm",
-    color: "#34d399",
+    color: "#15803D",
   },
   {
     key: "accel",
     label: "Accel",
     aliases: ["accel", "acceleration"],
     unit: "m/s²",
-    color: "#f87171",
+    color: "#B91C1C",
     dasharray: "3 3",
   },
 ];
@@ -350,6 +402,32 @@ function getCorrelationRelationship(coefficient: number | null): string {
   if (coefficient <= -0.7) return "Strong Negative";
   if (coefficient <= -0.3) return "Moderate Negative";
   return "Weak / No Relationship";
+}
+
+function formatSignedCorrelation(value: number): string {
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
+}
+
+function getCorrelationHeatmapColor(value: number): string {
+  const darkBlue: [number, number, number] = [30, 64, 175];
+  const lightBlue: [number, number, number] = [191, 219, 254];
+  const white: [number, number, number] = [255, 255, 255];
+  const lightRed: [number, number, number] = [254, 202, 202];
+  const darkRed: [number, number, number] = [185, 28, 28];
+  const clamped = clamp(value, -1, 1);
+
+  let color: [number, number, number];
+  if (clamped < -0.5) {
+    color = interpolateRgb(darkBlue, lightBlue, (clamped + 1) / 0.5);
+  } else if (clamped < 0) {
+    color = interpolateRgb(lightBlue, white, (clamped + 0.5) / 0.5);
+  } else if (clamped < 0.5) {
+    color = interpolateRgb(white, lightRed, clamped / 0.5);
+  } else {
+    color = interpolateRgb(lightRed, darkRed, (clamped - 0.5) / 0.5);
+  }
+
+  return `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
 }
 
 function median(values: number[]): number {
@@ -559,6 +637,428 @@ function alignByNearestNeighbor(
   return { alignedSource, alignedTarget, deltasMs };
 }
 
+function findNearestValue(
+  series: TimeValuePoint[],
+  targetTimeMs: number,
+  maxTimeDeltaMs: number,
+): number | null {
+  const insertIndex = lowerBoundByTime(series, targetTimeMs);
+  const candidateIndices = [insertIndex - 1, insertIndex];
+  let bestValue: number | null = null;
+  let bestDelta = Number.POSITIVE_INFINITY;
+
+  for (const candidateIndex of candidateIndices) {
+    if (candidateIndex < 0 || candidateIndex >= series.length) {
+      continue;
+    }
+
+    const point = series[candidateIndex];
+    const delta = Math.abs(point.timeMs - targetTimeMs);
+    if (delta <= maxTimeDeltaMs && delta < bestDelta) {
+      bestDelta = delta;
+      bestValue = point.value;
+    }
+  }
+
+  return bestValue;
+}
+
+function calculateMean(values: number[]): number {
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function calculateSampleStandardDeviation(values: number[], mean: number): number {
+  if (values.length < 2) return 0;
+
+  const variance =
+    values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (values.length - 1);
+  return Math.sqrt(variance);
+}
+
+function createIdentityMatrix(size: number): number[][] {
+  return Array.from({ length: size }, (_, rowIndex) =>
+    Array.from({ length: size }, (_, columnIndex) => (rowIndex === columnIndex ? 1 : 0)),
+  );
+}
+
+function jacobiEigenDecomposition(
+  matrix: number[][],
+): { eigenvalues: number[]; eigenvectors: number[][] } | null {
+  const size = matrix.length;
+  if (size === 0 || matrix.some((row) => row.length !== size)) {
+    return null;
+  }
+
+  const a = matrix.map((row) => [...row]);
+  const eigenvectors = createIdentityMatrix(size);
+  const maxIterations = 100;
+  const epsilon = 1e-10;
+
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    let p = 0;
+    let q = 1;
+    let largestOffDiagonal = 0;
+
+    for (let row = 0; row < size; row += 1) {
+      for (let column = row + 1; column < size; column += 1) {
+        const magnitude = Math.abs(a[row][column]);
+        if (magnitude > largestOffDiagonal) {
+          largestOffDiagonal = magnitude;
+          p = row;
+          q = column;
+        }
+      }
+    }
+
+    if (largestOffDiagonal < epsilon) {
+      break;
+    }
+
+    const app = a[p][p];
+    const aqq = a[q][q];
+    const apq = a[p][q];
+    const angle = 0.5 * Math.atan2(2 * apq, aqq - app);
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+
+    for (let i = 0; i < size; i += 1) {
+      if (i !== p && i !== q) {
+        const aip = a[i][p];
+        const aiq = a[i][q];
+        a[i][p] = cos * aip - sin * aiq;
+        a[p][i] = a[i][p];
+        a[i][q] = sin * aip + cos * aiq;
+        a[q][i] = a[i][q];
+      }
+    }
+
+    a[p][p] = cos ** 2 * app - 2 * sin * cos * apq + sin ** 2 * aqq;
+    a[q][q] = sin ** 2 * app + 2 * sin * cos * apq + cos ** 2 * aqq;
+    a[p][q] = 0;
+    a[q][p] = 0;
+
+    for (let i = 0; i < size; i += 1) {
+      const vip = eigenvectors[i][p];
+      const viq = eigenvectors[i][q];
+      eigenvectors[i][p] = cos * vip - sin * viq;
+      eigenvectors[i][q] = sin * vip + cos * viq;
+    }
+  }
+
+  const eigenvalues = a.map((row, index) => row[index]);
+  if (
+    eigenvalues.some((value) => !Number.isFinite(value)) ||
+    eigenvectors.some((row) => row.some((value) => !Number.isFinite(value)))
+  ) {
+    return null;
+  }
+
+  return { eigenvalues, eigenvectors };
+}
+
+function formatDurationMs(durationMs: number): string {
+  if (durationMs < 60 * 1000) return `${Math.round(durationMs / 1000)} sec`;
+  if (durationMs < 60 * 60 * 1000) return `${Math.round(durationMs / (60 * 1000))} min`;
+  if (durationMs < 24 * 60 * 60 * 1000) return `${Math.round(durationMs / (60 * 60 * 1000))} hr`;
+  return `${Math.round(durationMs / (24 * 60 * 60 * 1000))} day`;
+}
+
+function getAdaptiveAlignmentBucketSizeMs(
+  records: Array<SensorRecord & { value: number }>,
+  timeUnit: TimeUnit,
+): number {
+  if (records.length === 0) return 1000;
+
+  const firstTimeMs = records[0].timeMs;
+  const lastTimeMs = records[records.length - 1].timeMs;
+  const rangeMs = Math.max(0, lastTimeMs - firstTimeMs);
+
+  if (timeUnit === "seconds") return 1000;
+  if (timeUnit === "minutes") return rangeMs <= 2 * 60 * 1000 ? 1000 : 5 * 1000;
+  if (timeUnit === "hours") return 60 * 1000;
+  if (timeUnit === "days") return rangeMs <= 3 * 24 * 60 * 60 * 1000 ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  return rangeMs <= 2 * 24 * 60 * 60 * 1000 ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+}
+
+function buildAlignedSensorObservations(
+  records: Array<SensorRecord & { value: number }>,
+  timeUnit: TimeUnit,
+): AlignedSensorData {
+  const bucketSizeMs = getAdaptiveAlignmentBucketSizeMs(records, timeUnit);
+  const bucketMap = new Map<
+    number,
+    Partial<Record<ComparisonSensorKey, { value: number; deltaFromCenterMs: number }>>
+  >();
+
+  for (const record of records) {
+    const sensorDef = COMPARISON_SENSOR_DEFINITIONS.find((definition) =>
+      definition.aliases.includes(record.sensor),
+    );
+
+    if (!sensorDef) {
+      continue;
+    }
+
+    const bucketIndex = Math.floor(record.timeMs / bucketSizeMs);
+    const bucketStartMs = bucketIndex * bucketSizeMs;
+    const bucketCenterMs = bucketStartMs + bucketSizeMs / 2;
+    const deltaFromCenterMs = Math.abs(record.timeMs - bucketCenterMs);
+    const bucket = bucketMap.get(bucketStartMs) ?? {};
+    const previous = bucket[sensorDef.key];
+
+    if (!previous || deltaFromCenterMs < previous.deltaFromCenterMs) {
+      bucket[sensorDef.key] = {
+        value: record.value,
+        deltaFromCenterMs,
+      };
+    }
+
+    bucketMap.set(bucketStartMs, bucket);
+  }
+
+  const rows = Array.from(bucketMap.entries())
+    .map(([bucketStartMs, bucket]) => {
+      const values = Object.fromEntries(
+        Object.entries(bucket).map(([sensorKey, point]) => [
+          sensorKey,
+          point?.value,
+        ]),
+      ) as Partial<Record<ComparisonSensorKey, number>>;
+
+      return {
+        bucketStartMs,
+        bucketEndMs: bucketStartMs + bucketSizeMs,
+        values,
+      };
+    })
+    .filter((row) => Object.values(row.values).filter((value) => typeof value === "number").length >= 2)
+    .sort((a, b) => a.bucketStartMs - b.bucketStartMs);
+
+  return {
+    rows,
+    bucketSizeMs,
+    bucketSizeLabel: formatDurationMs(bucketSizeMs),
+  };
+}
+
+function createPcaDiagnosticMessage(diagnostics: PcaDiagnostics): string {
+  const zeroVarianceText =
+    diagnostics.zeroVarianceSensors.length > 0
+      ? diagnostics.zeroVarianceSensors.join(", ")
+      : "none";
+  const reasonText = diagnostics.failureReason ? ` Reason: ${diagnostics.failureReason}` : "";
+
+  return `PCA diagnostics: ${diagnostics.alignedObservations} aligned observations created; ${diagnostics.observationsUsed} observations used, ${diagnostics.requiredObservations} required; ${diagnostics.usableSensorCount} usable sensors; bucket size: ${diagnostics.bucketSizeLabel}; zero-variance sensors removed: ${zeroVarianceText}.${reasonText}`;
+}
+
+function calculatePcaAnalysis(
+  alignedData: AlignedSensorData,
+): PcaAnalysisResult {
+  const REQUIRED_OBSERVATIONS = 3;
+  const allSensorKeys = COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => sensorDef.key);
+  const valueCounts = allSensorKeys.reduce<Record<ComparisonSensorKey, number>>(
+    (acc, sensorKey) => {
+      acc[sensorKey] = alignedData.rows.filter(
+        (row) => typeof row.values[sensorKey] === "number",
+      ).length;
+      return acc;
+    },
+    {
+      temperature: 0,
+      humidity: 0,
+      pressure: 0,
+      distance: 0,
+      accel: 0,
+    },
+  );
+  const candidateSensors = allSensorKeys.filter(
+    (key) => valueCounts[key] >= REQUIRED_OBSERVATIONS,
+  );
+
+  if (candidateSensors.length < 2) {
+    const diagnostics: PcaDiagnostics = {
+      alignedObservations: alignedData.rows.length,
+      observationsUsed: 0,
+      requiredObservations: REQUIRED_OBSERVATIONS,
+      usableSensorCount: candidateSensors.length,
+      sensorsUsed: candidateSensors,
+      sensorsSkipped: allSensorKeys.filter((key) => !candidateSensors.includes(key)),
+      zeroVarianceSensors: [],
+      bucketSizeLabel: alignedData.bucketSizeLabel,
+      failureReason: "PCA requires at least two sensors with three aligned values.",
+    };
+
+    return {
+      status: "insufficient-sensors",
+      message: createPcaDiagnosticMessage(diagnostics),
+      diagnostics,
+    };
+  }
+
+  const pcaRows = alignedData.rows.filter(
+    (row) =>
+      candidateSensors.filter((sensorKey) => typeof row.values[sensorKey] === "number").length >=
+      2,
+  );
+
+  if (pcaRows.length < REQUIRED_OBSERVATIONS) {
+    const diagnostics: PcaDiagnostics = {
+      alignedObservations: alignedData.rows.length,
+      observationsUsed: pcaRows.length,
+      requiredObservations: REQUIRED_OBSERVATIONS,
+      usableSensorCount: candidateSensors.length,
+      sensorsUsed: candidateSensors,
+      sensorsSkipped: allSensorKeys.filter((key) => !candidateSensors.includes(key)),
+      zeroVarianceSensors: [],
+      bucketSizeLabel: alignedData.bucketSizeLabel,
+      failureReason: "Not enough bucketed rows contain at least two usable sensor values.",
+    };
+
+    return {
+      status: "insufficient-observations",
+      message: createPcaDiagnosticMessage(diagnostics),
+      diagnostics,
+    };
+  }
+
+  const presentValuesBySensor = candidateSensors.map((sensorKey) =>
+    pcaRows
+      .map((row) => row.values[sensorKey])
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value)),
+  );
+  const means = presentValuesBySensor.map((values) => calculateMean(values));
+  const standardDeviations = presentValuesBySensor.map((values, columnIndex) =>
+    calculateSampleStandardDeviation(values, means[columnIndex]),
+  );
+  const validColumnIndexes = standardDeviations
+    .map((standardDeviation, index) => ({ standardDeviation, index }))
+    .filter(({ standardDeviation }) => standardDeviation > 0 && Number.isFinite(standardDeviation))
+    .map(({ index }) => index);
+  const zeroVarianceSensors = standardDeviations
+    .map((standardDeviation, index) => ({ standardDeviation, sensor: candidateSensors[index] }))
+    .filter(({ standardDeviation }) => standardDeviation === 0 || !Number.isFinite(standardDeviation))
+    .map(({ sensor }) => sensor);
+
+  if (validColumnIndexes.length < 2) {
+    const sensorsUsed = validColumnIndexes.map((columnIndex) => candidateSensors[columnIndex]);
+    const diagnostics: PcaDiagnostics = {
+      alignedObservations: alignedData.rows.length,
+      observationsUsed: pcaRows.length,
+      requiredObservations: REQUIRED_OBSERVATIONS,
+      usableSensorCount: sensorsUsed.length,
+      sensorsUsed,
+      sensorsSkipped: allSensorKeys.filter((key) => !sensorsUsed.includes(key)),
+      zeroVarianceSensors,
+      bucketSizeLabel: alignedData.bucketSizeLabel,
+      failureReason: "Fewer than two usable sensors remain after removing zero-variance columns.",
+    };
+
+    return {
+      status: "insufficient-sensors",
+      message: createPcaDiagnosticMessage(diagnostics),
+      diagnostics,
+    };
+  }
+
+  const sensors = validColumnIndexes.map((columnIndex) => candidateSensors[columnIndex]);
+  const diagnostics: PcaDiagnostics = {
+    alignedObservations: alignedData.rows.length,
+    observationsUsed: pcaRows.length,
+    requiredObservations: REQUIRED_OBSERVATIONS,
+    usableSensorCount: sensors.length,
+    sensorsUsed: sensors,
+    sensorsSkipped: allSensorKeys.filter((key) => !sensors.includes(key)),
+    zeroVarianceSensors,
+    bucketSizeLabel: alignedData.bucketSizeLabel,
+    failureReason: null,
+  };
+  const standardizedRows = pcaRows.map((row) =>
+    validColumnIndexes.map((columnIndex) => {
+      const value = row.values[candidateSensors[columnIndex]];
+      // Bucketed telemetry can be sparse; mean-fill keeps rows usable after sensor selection.
+      const filledValue = typeof value === "number" ? value : means[columnIndex];
+      return (filledValue - means[columnIndex]) / standardDeviations[columnIndex];
+    }),
+  );
+
+  const covarianceMatrix = sensors.map((_, rowIndex) =>
+    sensors.map((__, columnIndex) => {
+      const covariance =
+        standardizedRows.reduce(
+          (sum, row) => sum + row[rowIndex] * row[columnIndex],
+          0,
+        ) /
+        (standardizedRows.length - 1);
+      return Number.isFinite(covariance) ? covariance : 0;
+    }),
+  );
+
+  const decomposition = jacobiEigenDecomposition(covarianceMatrix);
+  if (!decomposition) {
+    const failedDiagnostics = {
+      ...diagnostics,
+      failureReason: "Eigenvalue calculation failed for the covariance matrix.",
+    };
+
+    return {
+      status: "failed",
+      message: createPcaDiagnosticMessage(failedDiagnostics),
+      diagnostics: failedDiagnostics,
+    };
+  }
+
+  const eigenPairs = decomposition.eigenvalues
+    .map((eigenvalue, componentIndex) => ({
+      eigenvalue: Math.max(0, eigenvalue),
+      eigenvector: decomposition.eigenvectors.map((row) => row[componentIndex]),
+    }))
+    .sort((left, right) => right.eigenvalue - left.eigenvalue);
+
+  const totalEigenvalue = eigenPairs.reduce((sum, pair) => sum + pair.eigenvalue, 0);
+  if (totalEigenvalue <= 0 || !Number.isFinite(totalEigenvalue)) {
+    const failedDiagnostics = {
+      ...diagnostics,
+      failureReason: "PCA variance was zero or invalid after covariance calculation.",
+    };
+
+    return {
+      status: "failed",
+      message: createPcaDiagnosticMessage(failedDiagnostics),
+      diagnostics: failedDiagnostics,
+    };
+  }
+
+  let cumulativeVariance = 0;
+  const components = eigenPairs.slice(0, 3).map((pair, index) => {
+    const explainedVariance = pair.eigenvalue / totalEigenvalue;
+    cumulativeVariance += explainedVariance;
+
+    const topContributors = pair.eigenvector
+      .map((loading, sensorIndex) => ({
+        sensor: sensors[sensorIndex],
+        loading: Math.abs(loading),
+      }))
+      .sort((left, right) => right.loading - left.loading)
+      .slice(0, 3)
+      .map((item) => item.sensor);
+
+    return {
+      name: `PC${index + 1}`,
+      explainedVariance,
+      cumulativeVariance,
+      topContributors,
+    };
+  });
+
+  return {
+    status: "ok",
+    observations: standardizedRows.length,
+    sensors,
+    components,
+    diagnostics,
+  };
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
@@ -604,6 +1104,7 @@ export default function Home() {
   const [anomalySeverityFilter, setAnomalySeverityFilter] = useState<AnomalySeverityFilter>("All");
   const [hoveredHeatmapCell, setHoveredHeatmapCell] = useState<HeatmapHoverInfo | null>(null);
   const [heatmapViewMode, setHeatmapViewMode] = useState<HeatmapViewMode>("grid");
+  const [showCorrelationHeatmap, setShowCorrelationHeatmap] = useState(false);
   const [selectedOverlaySensors, setSelectedOverlaySensors] = useState<ComparisonSensorKey[]>([]);
   const [normalizeOverlay, setNormalizeOverlay] = useState(false);
   const [showFuturePrediction, setShowFuturePrediction] = useState(false);
@@ -1228,6 +1729,126 @@ export default function Home() {
     };
   }, [correlationSensorLabelByKey, windowedNumericRecords]);
 
+  const alignedSensorData = useMemo(() => {
+    return buildAlignedSensorObservations(windowedNumericRecords, timeUnit);
+  }, [timeUnit, windowedNumericRecords]);
+
+  const pcaAnalysis = useMemo(() => {
+    return calculatePcaAnalysis(alignedSensorData);
+  }, [alignedSensorData]);
+
+  const correlationHeatmapData = useMemo(() => {
+    const MIN_PAIR_OBSERVATIONS = 3;
+    const keys = COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => sensorDef.key);
+    const pairMatrix = keys.reduce<Record<ComparisonSensorKey, Record<ComparisonSensorKey, CorrelationHeatmapCell>>>(
+      (acc, row) => {
+        acc[row] = {
+          temperature: { row, column: "temperature", value: null, observations: 0 },
+          humidity: { row, column: "humidity", value: null, observations: 0 },
+          pressure: { row, column: "pressure", value: null, observations: 0 },
+          distance: { row, column: "distance", value: null, observations: 0 },
+          accel: { row, column: "accel", value: null, observations: 0 },
+        };
+        return acc;
+      },
+      {
+        temperature: {
+          temperature: { row: "temperature", column: "temperature", value: null, observations: 0 },
+          humidity: { row: "temperature", column: "humidity", value: null, observations: 0 },
+          pressure: { row: "temperature", column: "pressure", value: null, observations: 0 },
+          distance: { row: "temperature", column: "distance", value: null, observations: 0 },
+          accel: { row: "temperature", column: "accel", value: null, observations: 0 },
+        },
+        humidity: {
+          temperature: { row: "humidity", column: "temperature", value: null, observations: 0 },
+          humidity: { row: "humidity", column: "humidity", value: null, observations: 0 },
+          pressure: { row: "humidity", column: "pressure", value: null, observations: 0 },
+          distance: { row: "humidity", column: "distance", value: null, observations: 0 },
+          accel: { row: "humidity", column: "accel", value: null, observations: 0 },
+        },
+        pressure: {
+          temperature: { row: "pressure", column: "temperature", value: null, observations: 0 },
+          humidity: { row: "pressure", column: "humidity", value: null, observations: 0 },
+          pressure: { row: "pressure", column: "pressure", value: null, observations: 0 },
+          distance: { row: "pressure", column: "distance", value: null, observations: 0 },
+          accel: { row: "pressure", column: "accel", value: null, observations: 0 },
+        },
+        distance: {
+          temperature: { row: "distance", column: "temperature", value: null, observations: 0 },
+          humidity: { row: "distance", column: "humidity", value: null, observations: 0 },
+          pressure: { row: "distance", column: "pressure", value: null, observations: 0 },
+          distance: { row: "distance", column: "distance", value: null, observations: 0 },
+          accel: { row: "distance", column: "accel", value: null, observations: 0 },
+        },
+        accel: {
+          temperature: { row: "accel", column: "temperature", value: null, observations: 0 },
+          humidity: { row: "accel", column: "humidity", value: null, observations: 0 },
+          pressure: { row: "accel", column: "pressure", value: null, observations: 0 },
+          distance: { row: "accel", column: "distance", value: null, observations: 0 },
+          accel: { row: "accel", column: "accel", value: null, observations: 0 },
+        },
+      },
+    );
+
+    for (let i = 0; i < keys.length; i += 1) {
+      for (let j = i; j < keys.length; j += 1) {
+        const left = keys[i];
+        const right = keys[j];
+
+        if (left === right) {
+          const observations = alignedSensorData.rows.filter(
+            (row) => typeof row.values[left] === "number",
+          ).length;
+          pairMatrix[left][right] = { row: left, column: right, value: 1, observations };
+          continue;
+        }
+
+        const leftValues: number[] = [];
+        const rightValues: number[] = [];
+
+        for (const row of alignedSensorData.rows) {
+          const leftValue = row.values[left];
+          const rightValue = row.values[right];
+          if (typeof leftValue === "number" && typeof rightValue === "number") {
+            leftValues.push(leftValue);
+            rightValues.push(rightValue);
+          }
+        }
+
+        const observations = leftValues.length;
+        const coefficient =
+          observations >= MIN_PAIR_OBSERVATIONS
+            ? calculatePearsonCoefficient(leftValues, rightValues)
+            : null;
+        const cellValue = coefficient === null ? null : coefficient;
+
+        pairMatrix[left][right] = { row: left, column: right, value: cellValue, observations };
+        pairMatrix[right][left] = { row: right, column: left, value: cellValue, observations };
+      }
+    }
+
+    const sensors = keys.filter((sensorKey) =>
+      keys.some((otherSensorKey) => {
+        if (sensorKey === otherSensorKey) return false;
+        return pairMatrix[sensorKey][otherSensorKey].value !== null;
+      }),
+    );
+
+    const cells: CorrelationHeatmapCell[] = sensors.flatMap((row) =>
+      sensors.map((column) =>
+        row === column
+          ? { row, column, value: 1, observations: pairMatrix[row][column].observations }
+          : pairMatrix[row][column],
+      ),
+    );
+
+    return {
+      sensors,
+      cells,
+      bucketSizeLabel: alignedSensorData.bucketSizeLabel,
+    };
+  }, [alignedSensorData]);
+
   const toggleComparisonSensor = (sensorKey: ComparisonSensorKey) => {
     setSelectedComparisonSensors((previous) => {
       if (previous.includes(sensorKey)) {
@@ -1649,6 +2270,25 @@ export default function Home() {
   const selectedTimeWindowLabel =
     timeUnit === "all" ? "All available data" : `${timeAmount || "-"} ${timeUnit}`;
 
+  const formatPcaSensorList = (sensorKeys: ComparisonSensorKey[]) =>
+    sensorKeys.length > 0
+      ? sensorKeys.map((sensorKey) => correlationSensorLabelByKey[sensorKey]).join(", ")
+      : "None";
+
+  const formatPcaSentenceList = (sensorKeys: ComparisonSensorKey[]) => {
+    const labels = sensorKeys.map((sensorKey) => correlationSensorLabelByKey[sensorKey]);
+    if (labels.length === 0) return "available sensors";
+    if (labels.length === 1) return labels[0];
+    return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
+  };
+
+  const pcaInterpretation =
+    pcaAnalysis.status === "ok"
+      ? `Most system variability is explained by ${formatPcaSentenceList(
+          pcaAnalysis.components[0]?.topContributors.slice(0, 2) ?? [],
+        )}.`
+      : null;
+
   const sensorDefinitions: Array<{
     key: string;
     title: string;
@@ -1848,87 +2488,90 @@ export default function Home() {
   }, [allSuddenJumps, latestDistance, latestPressure, sensorOptions.length, windowedNumericRecords]);
 
   return (
-    <main className="min-h-screen bg-slate-100 text-slate-900">
-      <div className="mx-auto max-w-7xl space-y-8 px-4 py-10 sm:px-6 lg:px-8">
-        <header className="rounded-2xl bg-white p-7 shadow-sm ring-1 ring-slate-200">
-          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
+    <main className="min-h-screen bg-[#F6F8FB] text-[#0F172A]">
+      <div className="mx-auto max-w-7xl space-y-6 px-4 py-8 sm:px-6 lg:px-8">
+        <header className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">
+            Robot Telemetry Research Dashboard
+          </p>
+          <h1 className="mt-2 text-3xl font-semibold tracking-tight text-[#0F172A] sm:text-4xl">
             Engineering Decision Support Dashboard
           </h1>
-          <p className="mt-2 text-sm text-slate-600 sm:text-base">
+          <p className="mt-2 text-sm text-[#475569] sm:text-base">
             Operational telemetry summary for robot health and action prioritization
           </p>
 
           {dataLoadMessage && (
-            <div className="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+            <div className="mt-4 rounded-lg border border-[#D8E0EA] bg-[#FFF7ED] px-3 py-2 text-sm text-[#B45309]">
               {dataLoadMessage}
             </div>
           )}
 
           {dataSource === "demo" && !dataLoadMessage && (
-            <div className="mt-4 rounded-lg border border-sky-300 bg-sky-50 px-3 py-2 text-sm text-sky-900">
+            <div className="mt-4 rounded-lg border border-[#D8E0EA] bg-[#EFF6FF] px-3 py-2 text-sm text-[#1E3A8A]">
               Showing sanitized demo telemetry data.
             </div>
           )}
         </header>
 
-        <section className="rounded-2xl bg-white p-7 shadow-sm ring-1 ring-slate-200">
-          <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">Executive Summary</p>
+        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">Executive Summary</p>
           <div className="mt-5 grid gap-5 lg:grid-cols-3">
-            <article className="rounded-2xl bg-slate-50 p-6 ring-1 ring-slate-200 lg:col-span-2">
-              <p className="text-sm font-medium text-slate-600">Robot Health Score</p>
-              <p className="mt-2 text-5xl font-bold tracking-tight text-slate-900">
-                Robot Health Score: {engineeringDecision.healthScore}/100
+            <article className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] p-6 lg:col-span-2">
+              <p className="text-sm font-medium text-[#475569]">Robot Health Score</p>
+              <p className="mt-2 text-5xl font-semibold tracking-tight text-[#0F172A]">
+                {engineeringDecision.healthScore}<span className="text-2xl font-medium text-[#475569]">/100</span>
               </p>
               <span
                 className={`mt-4 inline-flex rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wide ${
                   engineeringDecision.healthStatus === "Excellent"
-                    ? "border-emerald-300 bg-emerald-50 text-emerald-800"
+                    ? "border-[#BBF7D0] bg-[#F0FDF4] text-[#15803D]"
                     : engineeringDecision.healthStatus === "Good"
-                      ? "border-sky-300 bg-sky-50 text-sky-800"
+                      ? "border-[#BFDBFE] bg-[#EFF6FF] text-[#1E3A8A]"
                       : engineeringDecision.healthStatus === "Warning"
-                        ? "border-amber-300 bg-amber-50 text-amber-800"
-                        : "border-rose-300 bg-rose-50 text-rose-800"
+                        ? "border-[#FDE68A] bg-[#FFFBEB] text-[#B45309]"
+                        : "border-[#FECACA] bg-[#FEF2F2] text-[#B91C1C]"
                 }`}
               >
                 {engineeringDecision.healthStatus}
               </span>
             </article>
 
-            <article className="rounded-2xl bg-slate-50 p-6 ring-1 ring-slate-200">
-              <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Window Summary</p>
+            <article className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-[#475569]">Window Summary</p>
               <div className="mt-2 space-y-2 text-sm">
-                <p className="flex items-center justify-between"><span className="text-slate-600">Time Window</span><span className="font-semibold text-slate-900">{selectedTimeWindowLabel}</span></p>
-                <p className="flex items-center justify-between"><span className="text-slate-600">Sensor Points</span><span className="font-semibold text-slate-900">{windowedNumericRecords.length}</span></p>
-                <p className="flex items-center justify-between"><span className="text-slate-600">Warnings</span><span className="font-semibold text-slate-900">{allSuddenJumps.length}</span></p>
-                <p className="flex items-center justify-between"><span className="text-slate-600">Active Sensors</span><span className="font-semibold text-slate-900">{sensorOptions.length}</span></p>
+                <p className="flex items-center justify-between border-b border-[#E2E8F0] pb-2"><span className="text-[#475569]">Time Window</span><span className="font-semibold text-[#0F172A]">{selectedTimeWindowLabel}</span></p>
+                <p className="flex items-center justify-between border-b border-[#E2E8F0] pb-2"><span className="text-[#475569]">Sensor Points</span><span className="font-semibold text-[#0F172A]">{windowedNumericRecords.length}</span></p>
+                <p className="flex items-center justify-between border-b border-[#E2E8F0] pb-2"><span className="text-[#475569]">Warnings</span><span className="font-semibold text-[#0F172A]">{allSuddenJumps.length}</span></p>
+                <p className="flex items-center justify-between"><span className="text-[#475569]">Active Sensors</span><span className="font-semibold text-[#0F172A]">{sensorOptions.length}</span></p>
               </div>
             </article>
           </div>
         </section>
 
         <section className="grid gap-5 lg:grid-cols-2">
-          <article className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
-            <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">System Status</p>
-            <p className="mt-2 text-3xl font-semibold text-slate-900">
-              {engineeringDecision.systemStatus.icon} {engineeringDecision.systemStatus.label}
+          <article className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+            <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">System Status</p>
+            <p className="mt-2 text-2xl font-semibold text-[#0F172A]">
+              {engineeringDecision.systemStatus.label}
             </p>
-            <ul className="mt-4 space-y-3 text-sm text-slate-700">
+            <ul className="mt-4 space-y-3 text-sm text-[#475569]">
               {engineeringDecision.topIssues.map((issue, index) => (
                 <li key={`${issue.text}-${index}`} className="flex items-start gap-2">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-600" />
+                  <AlertTriangle className="mt-0.5 h-4 w-4 text-[#B45309]" />
                   <span>{issue.text}</span>
                 </li>
               ))}
             </ul>
           </article>
 
-          <article className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
-            <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">Key Changes In Current Window</p>
+          <article className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+            <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">Key Changes In Current Window</p>
             <div className="mt-4 space-y-2.5">
               {keyChanges.map((change) => (
-                <div key={change.key} className="flex items-center justify-between rounded-xl bg-slate-50 px-4 py-3 text-sm ring-1 ring-slate-200">
-                  <span className="text-slate-700">{change.label}</span>
-                  <span className="font-semibold text-slate-900">
+                <div key={change.key} className="flex items-center justify-between rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3 text-sm">
+                  <span className="text-[#475569]">{change.label}</span>
+                  <span className="font-semibold text-[#0F172A]">
                     {change.direction.arrow} {change.deltaPct === null ? "N/A" : `${change.deltaPct >= 0 ? "+" : ""}${change.deltaPct.toFixed(1)}%`}
                   </span>
                 </div>
@@ -1937,27 +2580,27 @@ export default function Home() {
           </article>
         </section>
 
-        <section className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
-          <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">Sensor Overview</p>
+        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">Sensor Overview</p>
           <div className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
             {metricCards.map((card) => {
               const Icon = card.icon;
               return (
-                <article key={card.title} className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+                <article key={card.title} className="rounded-lg border border-[#D8E0EA] bg-white p-5">
                   <div className="flex items-center justify-between">
-                    <p className="text-sm font-medium text-slate-600">{card.title}</p>
-                    <Icon className="h-5 w-5 text-sky-700" />
+                    <p className="text-sm font-medium text-[#475569]">{card.title}</p>
+                    <Icon className="h-5 w-5 text-[#1E3A8A]" />
                   </div>
-                  <p className="mt-3 text-3xl font-semibold text-slate-900">
+                  <p className="mt-3 text-2xl font-semibold text-[#0F172A]">
                     {card.latest === null ? "N/A" : `${card.latest.toFixed(2)} ${card.unit}`}
                   </p>
-                  <p className="mt-2 text-sm font-medium text-slate-700">
+                  <p className="mt-2 text-sm font-medium text-[#475569]">
                     {card.trendArrow} {card.trendLabel}
                   </p>
-                  <p className="mt-2 text-xs text-slate-600">
+                  <p className="mt-2 text-xs text-[#475569]">
                     Stability: {card.stability.score === null ? "N/A" : `${card.stability.score}%`} · {card.stability.label}
                   </p>
-                  <p className="mt-1 text-xs text-slate-600">
+                  <p className="mt-1 text-xs text-[#475569]">
                     Forecast: {card.forecast.value === null
                       ? "Insufficient data"
                       : `${card.forecast.value.toFixed(1)}${card.unit} · ${card.forecast.direction}`}
@@ -1968,15 +2611,15 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
-          <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">Trend Graph</p>
+        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">Trend Graph</p>
           <div className="mt-4 grid gap-5 lg:grid-cols-4">
-            <article className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200 lg:col-span-3">
+            <article className="rounded-lg border border-[#D8E0EA] bg-white p-5 lg:col-span-3">
               <div className="mb-5 flex flex-wrap items-center gap-3">
                 <select
                   value={selectedSensor}
                   onChange={(event) => setSelectedSensor(event.target.value)}
-                  className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+                  className="rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#0F172A] outline-none focus:border-[#1E3A8A] focus:ring-2 focus:ring-blue-100"
                 >
                   {sensorOptions.map((sensor) => (
                     <option key={sensor} value={sensor}>
@@ -1992,7 +2635,7 @@ export default function Home() {
                   value={timeAmount}
                   onChange={(event) => setTimeAmount(event.target.value)}
                   disabled={timeUnit === "all"}
-                  className="w-24 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500"
+                  className="w-24 rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#0F172A] outline-none focus:border-[#1E3A8A] focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-[#F1F5F9] disabled:text-[#64748B]"
                   placeholder="Amount"
                   aria-label="Time amount"
                 />
@@ -2000,7 +2643,7 @@ export default function Home() {
                 <select
                   value={timeUnit}
                   onChange={(event) => setTimeUnit(event.target.value as TimeUnit)}
-                  className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+                  className="rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#0F172A] outline-none focus:border-[#1E3A8A] focus:ring-2 focus:ring-blue-100"
                   aria-label="Time unit"
                 >
                   <option value="seconds">seconds</option>
@@ -2010,35 +2653,35 @@ export default function Home() {
                   <option value="all">all</option>
                 </select>
 
-                <label className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700">
+                <label className="inline-flex items-center gap-2 rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#475569]">
                   <input
                     type="checkbox"
                     checked={showFuturePrediction}
                     onChange={(event) => setShowFuturePrediction(event.target.checked)}
-                    className="h-4 w-4 rounded border-slate-300 text-sky-700"
+                    className="h-4 w-4 rounded border-[#D8E0EA] text-[#1E3A8A]"
                   />
                   Future Prediction
                 </label>
 
-                <label className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700">
+                <label className="inline-flex items-center gap-2 rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#475569]">
                   <input
                     type="checkbox"
                     checked={normalizeOverlay}
                     onChange={(event) => setNormalizeOverlay(event.target.checked)}
-                    className="h-4 w-4 rounded border-slate-300 text-sky-700"
+                    className="h-4 w-4 rounded border-[#D8E0EA] text-[#1E3A8A]"
                   />
                   Normalize overlay
                 </label>
               </div>
 
               <div className="mb-4 flex flex-wrap items-center gap-2">
-                <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                <span className="text-xs font-semibold uppercase tracking-wide text-[#475569]">
                   Overlay sensors
                 </span>
                 {COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => (
                   <label
                     key={sensorDef.key}
-                    className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700"
+                    className="inline-flex items-center gap-2 rounded-full border border-[#D8E0EA] bg-white px-3 py-1.5 text-xs font-medium text-[#475569]"
                   >
                     <input
                       type="checkbox"
@@ -2050,31 +2693,31 @@ export default function Home() {
                             : previous.filter((key) => key !== sensorDef.key),
                         );
                       }}
-                      className="h-3.5 w-3.5 rounded border-slate-300 text-sky-700"
+                      className="h-3.5 w-3.5 rounded border-[#D8E0EA] text-[#1E3A8A]"
                     />
                     {sensorDef.label.split(" (")[0]}
                   </label>
                 ))}
               </div>
 
-              <div className="mb-4 space-y-1 text-xs text-slate-600">
+              <div className="mb-4 space-y-1 text-xs text-[#475569]">
                 <p>Use normalized overlay to compare sensor patterns across different units.</p>
                 <p>Forecast uses Gaussian weighting: recent readings influence prediction more than older readings.</p>
                 {showFuturePrediction && futurePredictionSeries.length === 0 && (
-                  <p className="font-medium text-amber-700">
+                  <p className="font-medium text-[#B45309]">
                     Future prediction requires at least 3 data points.
                   </p>
                 )}
               </div>
 
-              <div className="mb-4 rounded-xl bg-slate-50 px-3 py-2 font-mono text-[11px] text-slate-600 ring-1 ring-slate-200">
+              <div className="mb-4 rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2 font-mono text-[11px] text-[#475569]">
                 Sensor = {selectedSensor}&nbsp;&nbsp;|&nbsp;&nbsp;Points = {selectedSeries.length}&nbsp;&nbsp;|&nbsp;&nbsp;Time Range = {timeUnit === "all" ? "all" : `${timeAmount} ${timeUnit}`}
               </div>
 
               <div className="h-80 w-full">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={mainChartData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#cbd5e1" />
+                    <CartesianGrid strokeDasharray="3 3" stroke="#D8E0EA" />
                     <XAxis
                       dataKey="timeMs"
                       type="number"
@@ -2108,7 +2751,7 @@ export default function Home() {
                       ]}
                       contentStyle={{
                         backgroundColor: "#ffffff",
-                        border: "1px solid #cbd5e1",
+                        border: "1px solid #D8E0EA",
                         borderRadius: "0.5rem",
                         color: "#0f172a",
                       }}
@@ -2118,7 +2761,7 @@ export default function Home() {
                       type="monotone"
                       dataKey="primaryValue"
                       name={primaryComparisonSensor?.label.split(" (")[0] ?? selectedSensor}
-                      stroke="#2563eb"
+                      stroke="#1E3A8A"
                       strokeWidth={2.2}
                       dot={false}
                       activeDot={{ r: 4 }}
@@ -2147,7 +2790,7 @@ export default function Home() {
                         type="monotone"
                         dataKey="forecastValue"
                         name="Gaussian Forecast"
-                        stroke="#f59e0b"
+                        stroke="#EA580C"
                         strokeWidth={2}
                         strokeDasharray="6 4"
                         dot={false}
@@ -2161,32 +2804,32 @@ export default function Home() {
               </div>
             </article>
 
-            <aside className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
-              <h3 className="text-base font-medium text-slate-900">Current Chart Statistics</h3>
-              <p className="mt-1 text-xs text-slate-600">Computed from visible points in the active chart window</p>
-              <p className="mt-1 text-xs text-slate-500">Statistics shown for primary selected sensor.</p>
+            <aside className="rounded-lg border border-[#D8E0EA] bg-white p-5">
+              <h3 className="text-base font-medium text-[#0F172A]">Current Chart Statistics</h3>
+              <p className="mt-1 text-xs text-[#475569]">Computed from visible points in the active chart window</p>
+              <p className="mt-1 text-xs text-[#64748B]">Statistics shown for primary selected sensor.</p>
               <div className="mt-3 space-y-2">
-                <div className="rounded-xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200">
-                  <p className="text-[11px] uppercase tracking-wide text-slate-500">Min</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
+                  <p className="text-[11px] uppercase tracking-wide text-[#475569]">Min</p>
+                  <p className="mt-1 text-sm font-semibold text-[#0F172A]">
                     {chartStats.min === null ? "No data" : chartStats.min.toFixed(2)}
                   </p>
                 </div>
-                <div className="rounded-xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200">
-                  <p className="text-[11px] uppercase tracking-wide text-slate-500">Max</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
+                  <p className="text-[11px] uppercase tracking-wide text-[#475569]">Max</p>
+                  <p className="mt-1 text-sm font-semibold text-[#0F172A]">
                     {chartStats.max === null ? "No data" : chartStats.max.toFixed(2)}
                   </p>
                 </div>
-                <div className="rounded-xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200">
-                  <p className="text-[11px] uppercase tracking-wide text-slate-500">Average</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
+                  <p className="text-[11px] uppercase tracking-wide text-[#475569]">Average</p>
+                  <p className="mt-1 text-sm font-semibold text-[#0F172A]">
                     {chartStats.avg === null ? "No data" : chartStats.avg.toFixed(2)}
                   </p>
                 </div>
-                <div className="rounded-xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200">
-                  <p className="text-[11px] uppercase tracking-wide text-slate-500">Points</p>
-                  <p className="mt-1 text-sm font-semibold text-slate-900">
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
+                  <p className="text-[11px] uppercase tracking-wide text-[#475569]">Points</p>
+                  <p className="mt-1 text-sm font-semibold text-[#0F172A]">
                     {chartStats.points === 0 ? "No data" : chartStats.points}
                   </p>
                 </div>
@@ -2195,33 +2838,33 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
           <div className="max-w-3xl">
-            <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+            <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">
               Sensor Relationship Analysis
             </p>
-            <p className="mt-2 text-sm text-slate-600">
+            <p className="mt-2 text-sm text-[#475569]">
               Correlation helps identify whether changes in one sensor are related to changes in another.
             </p>
           </div>
 
-          <div className="mt-5 overflow-hidden rounded-xl ring-1 ring-slate-200">
+          <div className="mt-5 overflow-hidden rounded-lg border border-[#D8E0EA]">
             <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
-                <thead className="bg-slate-50">
+              <table className="min-w-full divide-y divide-[#D8E0EA] text-left text-sm">
+                <thead className="bg-[#F8FAFC]">
                   <tr>
-                    <th className="px-4 py-3 font-semibold text-slate-700" scope="col">
+                    <th className="px-4 py-3 font-semibold text-[#475569]" scope="col">
                       Sensor Pair
                     </th>
-                    <th className="px-4 py-3 font-semibold text-slate-700" scope="col">
+                    <th className="px-4 py-3 font-semibold text-[#475569]" scope="col">
                       Correlation
                     </th>
-                    <th className="px-4 py-3 font-semibold text-slate-700" scope="col">
+                    <th className="px-4 py-3 font-semibold text-[#475569]" scope="col">
                       Relationship
                     </th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-200 bg-white">
+                <tbody className="divide-y divide-[#E2E8F0] bg-white">
                   {[
                     { left: "temperature", right: "humidity" },
                     { left: "temperature", right: "pressure" },
@@ -2234,15 +2877,15 @@ export default function Home() {
 
                     return (
                       <tr key={`${left}-${right}`}>
-                        <td className="px-4 py-4 font-medium text-slate-900">
+                        <td className="px-4 py-4 font-medium text-[#0F172A]">
                           {correlationSensorLabelByKey[left]} and {correlationSensorLabelByKey[right]}
                         </td>
-                        <td className="px-4 py-4 font-mono font-semibold tabular-nums text-slate-900">
+                        <td className="px-4 py-4 font-mono font-semibold tabular-nums text-[#0F172A]">
                           {coefficient === null
                             ? "N/A"
                             : `${coefficient >= 0 ? "+" : ""}${coefficient.toFixed(2)}`}
                         </td>
-                        <td className="px-4 py-4 text-slate-700">
+                        <td className="px-4 py-4 text-[#475569]">
                           {getCorrelationRelationship(coefficient)}
                         </td>
                       </tr>
@@ -2254,12 +2897,274 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+          <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+            <div className="max-w-3xl">
+              <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">
+                PCA Analysis
+              </p>
+              <p className="mt-2 text-sm text-[#475569]">
+                Dimensionality reduction of current sensor window
+              </p>
+              <p className="mt-3 text-sm leading-6 text-[#475569]">
+                PCA reduces multiple sensor variables into principal components that capture the
+                dominant behavior of the robot.
+              </p>
+            </div>
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2 text-xs text-[#475569] lg:max-w-xs">
+              Based on PCA lecture: standardization {">"} covariance matrix {">"} eigenvalues/eigenvectors {">"} explained variance.
+            </div>
+          </div>
+
+          <div className="mt-5 grid gap-3 text-xs sm:grid-cols-2 xl:grid-cols-4">
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
+              <p className="uppercase tracking-wide text-[#475569]">Aligned observations</p>
+              <p className="mt-1 font-semibold text-[#0F172A]">
+                {pcaAnalysis.diagnostics.alignedObservations}
+              </p>
+            </div>
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
+              <p className="uppercase tracking-wide text-[#475569]">Observations used</p>
+              <p className="mt-1 font-semibold text-[#0F172A]">
+                {pcaAnalysis.diagnostics.observationsUsed}
+              </p>
+            </div>
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
+              <p className="uppercase tracking-wide text-[#475569]">Bucket size</p>
+              <p className="mt-1 font-semibold text-[#0F172A]">
+                {pcaAnalysis.diagnostics.bucketSizeLabel}
+              </p>
+            </div>
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
+              <p className="uppercase tracking-wide text-[#475569]">Sensors used</p>
+              <p className="mt-1 font-semibold text-[#0F172A]">
+                {formatPcaSensorList(pcaAnalysis.diagnostics.sensorsUsed)}
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-3 grid gap-3 text-xs sm:grid-cols-2">
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
+              <p className="uppercase tracking-wide text-[#475569]">Sensors skipped</p>
+              <p className="mt-1 font-semibold text-[#0F172A]">
+                {formatPcaSensorList(pcaAnalysis.diagnostics.sensorsSkipped)}
+              </p>
+            </div>
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
+              <p className="uppercase tracking-wide text-[#475569]">Time window used</p>
+              <p className="mt-1 font-semibold text-[#0F172A]">{selectedTimeWindowLabel}</p>
+            </div>
+          </div>
+
+          {pcaAnalysis.status === "ok" ? (
+            <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1.1fr]">
+              <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-1">
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
+                  <p className="text-[11px] uppercase tracking-wide text-[#475569]">PC1</p>
+                  <p className="mt-1 text-sm font-semibold text-[#0F172A]">
+                    PC1 explains {(pcaAnalysis.components[0]?.explainedVariance ?? 0).toLocaleString(undefined, {
+                      maximumFractionDigits: 1,
+                      style: "percent",
+                    })}{" "}
+                    of variance
+                  </p>
+                </div>
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
+                  <p className="text-[11px] uppercase tracking-wide text-[#475569]">PC2</p>
+                  <p className="mt-1 text-sm font-semibold text-[#0F172A]">
+                    PC2 explains {(pcaAnalysis.components[1]?.explainedVariance ?? 0).toLocaleString(undefined, {
+                      maximumFractionDigits: 1,
+                      style: "percent",
+                    })}{" "}
+                    of variance
+                  </p>
+                </div>
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
+                  <p className="text-[11px] uppercase tracking-wide text-[#475569]">Cumulative</p>
+                  <p className="mt-1 text-sm font-semibold text-[#0F172A]">
+                    PC1 + PC2 capture {(pcaAnalysis.components[1]?.cumulativeVariance ?? pcaAnalysis.components[0]?.cumulativeVariance ?? 0).toLocaleString(undefined, {
+                      maximumFractionDigits: 1,
+                      style: "percent",
+                    })}{" "}
+                    of system behavior
+                  </p>
+                </div>
+              </div>
+
+              <div className="overflow-hidden rounded-lg border border-[#D8E0EA]">
+                <table className="min-w-full divide-y divide-[#D8E0EA] text-left text-sm">
+                  <thead className="bg-[#F8FAFC]">
+                    <tr>
+                      <th className="px-4 py-3 font-semibold text-[#475569]" scope="col">
+                        Component
+                      </th>
+                      <th className="px-4 py-3 font-semibold text-[#475569]" scope="col">
+                        Top Contributors
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#E2E8F0] bg-white">
+                    {pcaAnalysis.components.slice(0, 2).map((component) => (
+                      <tr key={component.name}>
+                        <td className="px-4 py-4 font-mono font-semibold text-[#0F172A]">
+                          {component.name}
+                        </td>
+                        <td className="px-4 py-4 text-[#475569]">
+                          <div className="flex flex-wrap gap-2">
+                            {component.topContributors.map((sensorKey) => (
+                              <span
+                                key={`${component.name}-${sensorKey}`}
+                                className="rounded-full border border-[#D8E0EA] bg-[#F8FAFC] px-2.5 py-1 text-xs font-medium text-[#475569]"
+                              >
+                                {correlationSensorLabelByKey[sensorKey]}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {pcaInterpretation && (
+                  <p className="border-t border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3 text-sm font-medium text-[#475569]">
+                    {pcaInterpretation}
+                  </p>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="mt-5 rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+              {pcaAnalysis.message}
+            </div>
+          )}
+        </section>
+
+        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="max-w-3xl">
+              <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">
+                Correlation Heatmap
+              </p>
+              <p className="mt-2 text-sm text-[#475569]">
+                The heatmap provides an immediate visual summary of relationships between all sensors.
+                It complements the correlation table by making patterns easier to recognize.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowCorrelationHeatmap((previous) => !previous)}
+              className={`inline-flex shrink-0 items-center justify-center rounded-lg border px-4 py-2 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-blue-100 focus:ring-offset-2 ${
+                showCorrelationHeatmap
+                  ? "border-[#1E3A8A] bg-[#1E3A8A] text-white hover:bg-[#172554]"
+                  : "border-[#1E3A8A] bg-white text-[#1E3A8A] hover:bg-[#EFF6FF]"
+              }`}
+              aria-expanded={showCorrelationHeatmap}
+            >
+              {showCorrelationHeatmap ? "Hide Correlation Heatmap" : "Show Correlation Heatmap"}
+            </button>
+          </div>
+
+          <div
+            className={`overflow-hidden transition-all duration-300 ease-in-out ${
+              showCorrelationHeatmap ? "mt-5 max-h-[760px] opacity-100" : "mt-0 max-h-0 opacity-0"
+            }`}
+          >
+            {correlationHeatmapData.sensors.length < 2 ? (
+              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+                Not enough data to generate heatmap.
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="overflow-x-auto rounded-lg border border-[#D8E0EA]">
+                  <div
+                    className="grid min-w-[520px] bg-[#D8E0EA] text-xs"
+                    style={{
+                      gridTemplateColumns: `minmax(92px, 0.9fr) repeat(${correlationHeatmapData.sensors.length}, minmax(78px, 1fr))`,
+                    }}
+                  >
+                    <div className="bg-[#F8FAFC] px-3 py-2 font-semibold text-[#475569]" />
+                    {correlationHeatmapData.sensors.map((sensorKey) => (
+                      <div
+                        key={`heatmap-column-${sensorKey}`}
+                        className="bg-[#F8FAFC] px-3 py-2 text-center font-semibold text-[#475569]"
+                      >
+                        {correlationSensorLabelByKey[sensorKey]}
+                      </div>
+                    ))}
+
+                    {correlationHeatmapData.sensors.map((rowKey) => (
+                      <div key={`heatmap-row-${rowKey}`} className="contents">
+                        <div className="bg-[#F8FAFC] px-3 py-3 font-semibold text-[#475569]">
+                          {correlationSensorLabelByKey[rowKey]}
+                        </div>
+                        {correlationHeatmapData.sensors.map((columnKey) => {
+                          const cell = correlationHeatmapData.cells.find(
+                            (item) => item.row === rowKey && item.column === columnKey,
+                          );
+                          const value = cell?.value ?? null;
+                          const isStrong = value !== null && Math.abs(value) >= 0.75;
+                          const displayValue =
+                            rowKey === columnKey
+                              ? "1.00"
+                              : value === null
+                                ? "N/A"
+                                : formatSignedCorrelation(value);
+                          const tooltipValue =
+                            value === null ? "N/A" : rowKey === columnKey ? "1.00" : formatSignedCorrelation(value);
+
+                          return (
+                            <div
+                              key={`heatmap-cell-${rowKey}-${columnKey}`}
+                              className={`flex min-h-14 items-center justify-center border-l border-t border-white px-2 py-3 text-center font-mono text-sm font-semibold tabular-nums ${
+                                isStrong ? "text-white" : "text-[#0F172A]"
+                              }`}
+                              style={{
+                                backgroundColor:
+                                  value === null ? "rgb(248, 250, 252)" : getCorrelationHeatmapColor(value),
+                              }}
+                              title={`${correlationSensorLabelByKey[rowKey]} ↔ ${correlationSensorLabelByKey[columnKey]}\nCorrelation = ${tooltipValue}\nObservations used = ${cell?.observations ?? 0}`}
+                            >
+                              {displayValue}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-2 text-xs text-[#475569] sm:flex-row sm:items-center sm:justify-between">
+                  <div className="font-medium text-[#475569]">
+                    Bucket size: {correlationHeatmapData.bucketSizeLabel}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium text-[#475569]">Strong Negative</span>
+                    <span>{"<-"}</span>
+                    <span>Blue</span>
+                  </div>
+                  <div className="h-2 min-w-36 rounded-full bg-gradient-to-r from-blue-800 via-white to-red-700 ring-1 ring-[#D8E0EA]" />
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium text-[#475569]">No Correlation</span>
+                    <span>{"<-"}</span>
+                    <span>White</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium text-[#475569]">Strong Positive</span>
+                    <span>{"<-"}</span>
+                    <span>Red</span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </section>
+
+        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
           <div className="max-w-3xl">
-            <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+            <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">
               Research Methods Used
             </p>
-            <p className="mt-2 text-sm text-slate-600">
+            <p className="mt-2 text-sm text-[#475569]">
               Scientific methods applied to the selected telemetry and decision-support outputs.
             </p>
           </div>
@@ -2302,15 +3207,15 @@ export default function Home() {
               return (
                 <article
                   key={method.title}
-                  className="rounded-2xl bg-white p-5 ring-1 ring-slate-200"
+                  className="rounded-lg border border-[#D8E0EA] bg-white p-5"
                 >
-                  <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-100 ring-1 ring-slate-200">
-                    <Icon className="h-4 w-4 text-sky-700" aria-hidden="true" />
+                  <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#D8E0EA] bg-[#F8FAFC]">
+                    <Icon className="h-4 w-4 text-[#1E3A8A]" aria-hidden="true" />
                   </div>
-                  <h3 className="mt-4 text-sm font-semibold text-slate-900">
+                  <h3 className="mt-4 text-sm font-semibold text-[#0F172A]">
                     {method.title}
                   </h3>
-                  <p className="mt-2 text-sm leading-6 text-slate-600">
+                  <p className="mt-2 text-sm leading-6 text-[#475569]">
                     {method.description}
                   </p>
                 </article>
@@ -2319,10 +3224,10 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
-          <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">Recommended Action</p>
-          <p className="mt-2 text-xl font-semibold text-slate-900">{engineeringDecision.recommendation}</p>
-          <p className="mt-2 text-sm text-slate-600">Confidence: {aiAnalysis.confidence}%</p>
+        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">Recommended Action</p>
+          <p className="mt-2 text-xl font-semibold text-[#0F172A]">{engineeringDecision.recommendation}</p>
+          <p className="mt-2 text-sm text-[#475569]">Confidence: {aiAnalysis.confidence}%</p>
         </section>
       </div>
     </main>
