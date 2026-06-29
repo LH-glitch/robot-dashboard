@@ -98,6 +98,7 @@ type PcaComponentSummary = {
   explainedVariance: number;
   cumulativeVariance: number;
   topContributors: ComparisonSensorKey[];
+  contributorScores: Array<{ sensor: ComparisonSensorKey; score: number }>;
 };
 
 type PcaDiagnostics = {
@@ -1033,12 +1034,13 @@ function calculatePcaAnalysis(
     const explainedVariance = pair.eigenvalue / totalEigenvalue;
     cumulativeVariance += explainedVariance;
 
-    const topContributors = pair.eigenvector
+    const contributorScores = pair.eigenvector
       .map((loading, sensorIndex) => ({
         sensor: sensors[sensorIndex],
-        loading: Math.abs(loading),
+        score: Math.abs(loading),
       }))
-      .sort((left, right) => right.loading - left.loading)
+      .sort((left, right) => right.score - left.score);
+    const topContributors = contributorScores
       .slice(0, 3)
       .map((item) => item.sensor);
 
@@ -1047,6 +1049,7 @@ function calculatePcaAnalysis(
       explainedVariance,
       cumulativeVariance,
       topContributors,
+      contributorScores,
     };
   });
 
@@ -1104,6 +1107,8 @@ export default function Home() {
   const [anomalySeverityFilter, setAnomalySeverityFilter] = useState<AnomalySeverityFilter>("All");
   const [hoveredHeatmapCell, setHoveredHeatmapCell] = useState<HeatmapHoverInfo | null>(null);
   const [heatmapViewMode, setHeatmapViewMode] = useState<HeatmapViewMode>("grid");
+  const [showPcaAnalysis, setShowPcaAnalysis] = useState(false);
+  const [showSensorImportanceRanking, setShowSensorImportanceRanking] = useState(false);
   const [showCorrelationHeatmap, setShowCorrelationHeatmap] = useState(false);
   const [selectedOverlaySensors, setSelectedOverlaySensors] = useState<ComparisonSensorKey[]>([]);
   const [normalizeOverlay, setNormalizeOverlay] = useState(false);
@@ -2289,6 +2294,24 @@ export default function Home() {
         )}.`
       : null;
 
+  const pcaSensorImportance = useMemo(() => {
+    if (pcaAnalysis.status !== "ok") return [];
+
+    const pc1Scores = pcaAnalysis.components[0]?.contributorScores ?? [];
+    const maxScore = Math.max(...pc1Scores.map((item) => item.score), 0);
+
+    return pc1Scores.map((item) => ({
+      sensor: item.sensor,
+      scorePercent: maxScore > 0 ? Math.round((item.score / maxScore) * 100) : 0,
+    }));
+  }, [pcaAnalysis]);
+
+  const getDirectionColorClass = (label: string) => {
+    if (label === "Rising") return "text-[#2E7D32]";
+    if (label === "Falling") return "text-[#C62828]";
+    return "text-[#607D8B]";
+  };
+
   const sensorDefinitions: Array<{
     key: string;
     title: string;
@@ -2487,18 +2510,27 @@ export default function Home() {
     };
   }, [allSuddenJumps, latestDistance, latestPressure, sensorOptions.length, windowedNumericRecords]);
 
+  const recommendedPriority =
+    engineeringDecision.healthScore < 50 || engineeringDecision.topIssues[0]?.severity >= 3
+      ? "HIGH"
+      : engineeringDecision.healthScore < 75 || engineeringDecision.topIssues[0]?.severity >= 2
+        ? "MEDIUM"
+        : "LOW";
+
+  const recommendedImpact = recommendedPriority === "LOW" ? "MODERATE" : "HIGH";
+
   return (
     <main className="min-h-screen bg-[#F6F8FB] text-[#0F172A]">
       <div className="mx-auto max-w-7xl space-y-6 px-4 py-8 sm:px-6 lg:px-8">
-        <header className="rounded-lg border border-[#D8E0EA] bg-white p-6">
-          <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">
+        <header className="rounded-lg border border-[#D8E0EA] bg-white px-6 py-7">
+          <p className="text-xs font-semibold uppercase tracking-wide text-[#1F4E8C]">
             Robot Telemetry Research Dashboard
           </p>
-          <h1 className="mt-2 text-3xl font-semibold tracking-tight text-[#0F172A] sm:text-4xl">
+          <h1 className="mt-3 text-4xl font-semibold tracking-tight text-[#0F172A] sm:text-5xl">
             Engineering Decision Support Dashboard
           </h1>
-          <p className="mt-2 text-sm text-[#475569] sm:text-base">
-            Operational telemetry summary for robot health and action prioritization
+          <p className="mt-3 max-w-4xl text-base font-medium leading-7 text-[#475569] sm:text-lg">
+            Real-Time Robot Telemetry Analysis using Statistical &amp; Machine Learning Techniques
           </p>
 
           {dataLoadMessage && (
@@ -2508,29 +2540,29 @@ export default function Home() {
           )}
 
           {dataSource === "demo" && !dataLoadMessage && (
-            <div className="mt-4 rounded-lg border border-[#D8E0EA] bg-[#EFF6FF] px-3 py-2 text-sm text-[#1E3A8A]">
+            <div className="mt-4 rounded-lg border border-[#D8E0EA] bg-[#EFF6FF] px-3 py-2 text-sm text-[#1F4E8C]">
               Showing sanitized demo telemetry data.
             </div>
           )}
         </header>
 
         <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
-          <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">Executive Summary</p>
-          <div className="mt-5 grid gap-5 lg:grid-cols-3">
-            <article className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] p-6 lg:col-span-2">
-              <p className="text-sm font-medium text-[#475569]">Robot Health Score</p>
-              <p className="mt-2 text-5xl font-semibold tracking-tight text-[#0F172A]">
-                {engineeringDecision.healthScore}<span className="text-2xl font-medium text-[#475569]">/100</span>
+          <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">Executive Summary</p>
+          <div className="mt-4 grid gap-5 lg:grid-cols-3">
+            <article className="flex flex-col items-center justify-center rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] p-5 text-center lg:col-span-2">
+              <p className="text-sm font-semibold uppercase tracking-wide text-[#475569]">Health Score</p>
+              <p className="mt-2 text-[64px] font-semibold leading-none tracking-tight text-[#0F172A] sm:text-[72px]">
+                {engineeringDecision.healthScore}
               </p>
               <span
-                className={`mt-4 inline-flex rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wide ${
+                className={`mt-3 inline-flex rounded-full border px-4 py-1.5 text-xs font-bold uppercase tracking-wide ${
                   engineeringDecision.healthStatus === "Excellent"
-                    ? "border-[#BBF7D0] bg-[#F0FDF4] text-[#15803D]"
+                    ? "border-[#A5D6A7] bg-[#F1F8E9] text-[#2E7D32]"
                     : engineeringDecision.healthStatus === "Good"
-                      ? "border-[#BFDBFE] bg-[#EFF6FF] text-[#1E3A8A]"
+                      ? "border-[#BBD4F0] bg-[#EFF6FF] text-[#1F4E8C]"
                       : engineeringDecision.healthStatus === "Warning"
-                        ? "border-[#FDE68A] bg-[#FFFBEB] text-[#B45309]"
-                        : "border-[#FECACA] bg-[#FEF2F2] text-[#B91C1C]"
+                        ? "border-[#F9D66B] bg-[#FFF8E1] text-[#B45309]"
+                        : "border-[#F0B4B4] bg-[#FDECEC] text-[#C62828]"
                 }`}
               >
                 {engineeringDecision.healthStatus}
@@ -2538,12 +2570,12 @@ export default function Home() {
             </article>
 
             <article className="rounded-lg border border-[#D8E0EA] bg-white p-6">
-              <p className="text-[11px] font-semibold uppercase tracking-wide text-[#475569]">Window Summary</p>
-              <div className="mt-2 space-y-2 text-sm">
-                <p className="flex items-center justify-between border-b border-[#E2E8F0] pb-2"><span className="text-[#475569]">Time Window</span><span className="font-semibold text-[#0F172A]">{selectedTimeWindowLabel}</span></p>
-                <p className="flex items-center justify-between border-b border-[#E2E8F0] pb-2"><span className="text-[#475569]">Sensor Points</span><span className="font-semibold text-[#0F172A]">{windowedNumericRecords.length}</span></p>
-                <p className="flex items-center justify-between border-b border-[#E2E8F0] pb-2"><span className="text-[#475569]">Warnings</span><span className="font-semibold text-[#0F172A]">{allSuddenJumps.length}</span></p>
-                <p className="flex items-center justify-between"><span className="text-[#475569]">Active Sensors</span><span className="font-semibold text-[#0F172A]">{sensorOptions.length}</span></p>
+              <p className="text-[13px] font-semibold uppercase tracking-wide text-[#475569]">Window Summary</p>
+              <div className="mt-3 space-y-2.5 text-sm">
+                <p className="flex items-center justify-between gap-3 border-b border-[#E2E8F0] pb-2"><span className="font-medium text-[#475569]">Time Window</span><span className="font-bold text-[#1F4E8C]">{selectedTimeWindowLabel}</span></p>
+                <p className="flex items-center justify-between gap-3 border-b border-[#E2E8F0] pb-2"><span className="font-medium text-[#475569]">Sensor Points</span><span className="font-bold text-[#1F4E8C]">{windowedNumericRecords.length}</span></p>
+                <p className="flex items-center justify-between gap-3 border-b border-[#E2E8F0] pb-2"><span className="font-medium text-[#475569]">Warnings</span><span className="font-bold text-[#1F4E8C]">{allSuddenJumps.length}</span></p>
+                <p className="flex items-center justify-between gap-3"><span className="font-medium text-[#475569]">Active Sensors</span><span className="font-bold text-[#1F4E8C]">{sensorOptions.length}</span></p>
               </div>
             </article>
           </div>
@@ -2551,14 +2583,22 @@ export default function Home() {
 
         <section className="grid gap-5 lg:grid-cols-2">
           <article className="rounded-lg border border-[#D8E0EA] bg-white p-6">
-            <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">System Status</p>
-            <p className="mt-2 text-2xl font-semibold text-[#0F172A]">
+            <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">System Status</p>
+            <p
+              className={`mt-2 text-2xl font-semibold ${
+                engineeringDecision.healthStatus === "Critical"
+                  ? "text-[#C62828]"
+                  : engineeringDecision.healthStatus === "Warning"
+                    ? "text-[#B45309]"
+                    : "text-[#0F172A]"
+              }`}
+            >
               {engineeringDecision.systemStatus.label}
             </p>
-            <ul className="mt-4 space-y-3 text-sm text-[#475569]">
+            <ul className="mt-5 space-y-3.5 text-sm text-[#475569]">
               {engineeringDecision.topIssues.map((issue, index) => (
-                <li key={`${issue.text}-${index}`} className="flex items-start gap-2">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 text-[#B45309]" />
+                <li key={`${issue.text}-${index}`} className="flex items-start gap-3 rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2.5">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#F9A825]" />
                   <span>{issue.text}</span>
                 </li>
               ))}
@@ -2566,12 +2606,12 @@ export default function Home() {
           </article>
 
           <article className="rounded-lg border border-[#D8E0EA] bg-white p-6">
-            <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">Key Changes In Current Window</p>
+            <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">Key Changes In Current Window</p>
             <div className="mt-4 space-y-2.5">
               {keyChanges.map((change) => (
                 <div key={change.key} className="flex items-center justify-between rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3 text-sm">
                   <span className="text-[#475569]">{change.label}</span>
-                  <span className="font-semibold text-[#0F172A]">
+                  <span className={`font-bold ${getDirectionColorClass(change.direction.label)}`}>
                     {change.direction.arrow} {change.deltaPct === null ? "N/A" : `${change.deltaPct >= 0 ? "+" : ""}${change.deltaPct.toFixed(1)}%`}
                   </span>
                 </div>
@@ -2581,7 +2621,7 @@ export default function Home() {
         </section>
 
         <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
-          <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">Sensor Overview</p>
+          <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">Sensor Overview</p>
           <div className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
             {metricCards.map((card) => {
               const Icon = card.icon;
@@ -2589,7 +2629,7 @@ export default function Home() {
                 <article key={card.title} className="rounded-lg border border-[#D8E0EA] bg-white p-5">
                   <div className="flex items-center justify-between">
                     <p className="text-sm font-medium text-[#475569]">{card.title}</p>
-                    <Icon className="h-5 w-5 text-[#1E3A8A]" />
+                    <Icon className="h-6 w-6 text-[#1F4E8C]" />
                   </div>
                   <p className="mt-3 text-2xl font-semibold text-[#0F172A]">
                     {card.latest === null ? "N/A" : `${card.latest.toFixed(2)} ${card.unit}`}
@@ -2597,10 +2637,25 @@ export default function Home() {
                   <p className="mt-2 text-sm font-medium text-[#475569]">
                     {card.trendArrow} {card.trendLabel}
                   </p>
+                  <div className="mt-4 border-t border-[#E2E8F0] pt-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-[#607D8B]">Forecast</p>
+                    {card.forecast.value === null ? (
+                      <p className="mt-1 text-sm font-semibold text-[#607D8B]">Insufficient data</p>
+                    ) : (
+                      <>
+                        <p className="mt-1 text-lg font-semibold text-[#0F172A]">
+                          {card.forecast.value.toFixed(1)}{card.unit}
+                        </p>
+                        <p className={`mt-0.5 text-sm font-semibold ${getDirectionColorClass(card.forecast.direction)}`}>
+                          {card.forecast.direction === "Rising" ? "↑" : card.forecast.direction === "Falling" ? "↓" : "→"} {card.forecast.direction}
+                        </p>
+                      </>
+                    )}
+                  </div>
                   <p className="mt-2 text-xs text-[#475569]">
                     Stability: {card.stability.score === null ? "N/A" : `${card.stability.score}%`} · {card.stability.label}
                   </p>
-                  <p className="mt-1 text-xs text-[#475569]">
+                  <p className="hidden">
                     Forecast: {card.forecast.value === null
                       ? "Insufficient data"
                       : `${card.forecast.value.toFixed(1)}${card.unit} · ${card.forecast.direction}`}
@@ -2612,14 +2667,14 @@ export default function Home() {
         </section>
 
         <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
-          <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">Trend Graph</p>
+          <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">Sensor Trend Comparison</p>
           <div className="mt-4 grid gap-5 lg:grid-cols-4">
             <article className="rounded-lg border border-[#D8E0EA] bg-white p-5 lg:col-span-3">
               <div className="mb-5 flex flex-wrap items-center gap-3">
                 <select
                   value={selectedSensor}
                   onChange={(event) => setSelectedSensor(event.target.value)}
-                  className="rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#0F172A] outline-none focus:border-[#1E3A8A] focus:ring-2 focus:ring-blue-100"
+                  className="rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#0F172A] outline-none focus:border-[#1F4E8C] focus:ring-2 focus:ring-blue-100"
                 >
                   {sensorOptions.map((sensor) => (
                     <option key={sensor} value={sensor}>
@@ -2635,7 +2690,7 @@ export default function Home() {
                   value={timeAmount}
                   onChange={(event) => setTimeAmount(event.target.value)}
                   disabled={timeUnit === "all"}
-                  className="w-24 rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#0F172A] outline-none focus:border-[#1E3A8A] focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-[#F1F5F9] disabled:text-[#64748B]"
+                  className="w-24 rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#0F172A] outline-none focus:border-[#1F4E8C] focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-[#F1F5F9] disabled:text-[#64748B]"
                   placeholder="Amount"
                   aria-label="Time amount"
                 />
@@ -2643,7 +2698,7 @@ export default function Home() {
                 <select
                   value={timeUnit}
                   onChange={(event) => setTimeUnit(event.target.value as TimeUnit)}
-                  className="rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#0F172A] outline-none focus:border-[#1E3A8A] focus:ring-2 focus:ring-blue-100"
+                  className="rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-sm text-[#0F172A] outline-none focus:border-[#1F4E8C] focus:ring-2 focus:ring-blue-100"
                   aria-label="Time unit"
                 >
                   <option value="seconds">seconds</option>
@@ -2658,7 +2713,7 @@ export default function Home() {
                     type="checkbox"
                     checked={showFuturePrediction}
                     onChange={(event) => setShowFuturePrediction(event.target.checked)}
-                    className="h-4 w-4 rounded border-[#D8E0EA] text-[#1E3A8A]"
+                    className="h-4 w-4 rounded border-[#D8E0EA] text-[#1F4E8C]"
                   />
                   Future Prediction
                 </label>
@@ -2668,7 +2723,7 @@ export default function Home() {
                     type="checkbox"
                     checked={normalizeOverlay}
                     onChange={(event) => setNormalizeOverlay(event.target.checked)}
-                    className="h-4 w-4 rounded border-[#D8E0EA] text-[#1E3A8A]"
+                    className="h-4 w-4 rounded border-[#D8E0EA] text-[#1F4E8C]"
                   />
                   Normalize overlay
                 </label>
@@ -2693,7 +2748,7 @@ export default function Home() {
                             : previous.filter((key) => key !== sensorDef.key),
                         );
                       }}
-                      className="h-3.5 w-3.5 rounded border-[#D8E0EA] text-[#1E3A8A]"
+                      className="h-3.5 w-3.5 rounded border-[#D8E0EA] text-[#1F4E8C]"
                     />
                     {sensorDef.label.split(" (")[0]}
                   </label>
@@ -2756,13 +2811,13 @@ export default function Home() {
                         color: "#0f172a",
                       }}
                     />
-                    <Legend verticalAlign="top" height={30} wrapperStyle={{ fontSize: 12 }} />
+                    <Legend verticalAlign="top" height={38} wrapperStyle={{ fontSize: 12, paddingBottom: 8 }} />
                     <Line
                       type="monotone"
                       dataKey="primaryValue"
                       name={primaryComparisonSensor?.label.split(" (")[0] ?? selectedSensor}
-                      stroke="#1E3A8A"
-                      strokeWidth={2.2}
+                      stroke="#1F4E8C"
+                      strokeWidth={2.8}
                       dot={false}
                       activeDot={{ r: 4 }}
                       isAnimationActive
@@ -2777,7 +2832,7 @@ export default function Home() {
                           dataKey={`overlay_${sensorDef.key}`}
                           name={sensorDef.label.split(" (")[0]}
                           stroke={sensorDef.color}
-                          strokeWidth={1.8}
+                          strokeWidth={2.2}
                           strokeDasharray={sensorDef.dasharray}
                           dot={false}
                           activeDot={{ r: 3 }}
@@ -2791,8 +2846,8 @@ export default function Home() {
                         dataKey="forecastValue"
                         name="Gaussian Forecast"
                         stroke="#EA580C"
-                        strokeWidth={2}
-                        strokeDasharray="6 4"
+                        strokeWidth={2.6}
+                        strokeDasharray="7 5"
                         dot={false}
                         activeDot={{ r: 3 }}
                         isAnimationActive
@@ -2840,7 +2895,7 @@ export default function Home() {
 
         <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
           <div className="max-w-3xl">
-            <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">
+            <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">
               Sensor Relationship Analysis
             </p>
             <p className="mt-2 text-sm text-[#475569]">
@@ -2900,7 +2955,7 @@ export default function Home() {
         <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
             <div className="max-w-3xl">
-              <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">
+              <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">
                 PCA Analysis
               </p>
               <p className="mt-2 text-sm text-[#475569]">
@@ -2914,9 +2969,26 @@ export default function Home() {
             <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2 text-xs text-[#475569] lg:max-w-xs">
               Based on PCA lecture: standardization {">"} covariance matrix {">"} eigenvalues/eigenvectors {">"} explained variance.
             </div>
+            <button
+              type="button"
+              onClick={() => setShowPcaAnalysis((previous) => !previous)}
+              className={`inline-flex shrink-0 items-center justify-center rounded-lg border px-4 py-2 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-blue-100 focus:ring-offset-2 ${
+                showPcaAnalysis
+                  ? "border-[#1F4E8C] bg-[#1F4E8C] text-white hover:bg-[#173B69]"
+                  : "border-[#1F4E8C] bg-white text-[#1F4E8C] hover:bg-[#EFF6FF]"
+              }`}
+              aria-expanded={showPcaAnalysis}
+            >
+              {showPcaAnalysis ? "Hide PCA Analysis" : "Show PCA Analysis"}
+            </button>
           </div>
 
-          <div className="mt-5 grid gap-3 text-xs sm:grid-cols-2 xl:grid-cols-4">
+          <div
+            className={`overflow-hidden transition-all duration-300 ease-in-out ${
+              showPcaAnalysis ? "mt-5 max-h-[980px] opacity-100" : "mt-0 max-h-0 opacity-0"
+            }`}
+          >
+            <div className="grid gap-3 text-xs sm:grid-cols-2 xl:grid-cols-4">
             <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
               <p className="uppercase tracking-wide text-[#475569]">Aligned observations</p>
               <p className="mt-1 font-semibold text-[#0F172A]">
@@ -2943,7 +3015,7 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="mt-3 grid gap-3 text-xs sm:grid-cols-2">
+            <div className="mt-3 grid gap-3 text-xs sm:grid-cols-2">
             <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
               <p className="uppercase tracking-wide text-[#475569]">Sensors skipped</p>
               <p className="mt-1 font-semibold text-[#0F172A]">
@@ -2956,29 +3028,29 @@ export default function Home() {
             </div>
           </div>
 
-          {pcaAnalysis.status === "ok" ? (
+            {pcaAnalysis.status === "ok" ? (
             <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1.1fr]">
               <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-1">
-                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
-                  <p className="text-[11px] uppercase tracking-wide text-[#475569]">PC1</p>
-                  <p className="mt-1 text-sm font-semibold text-[#0F172A]">
-                    PC1 explains {(pcaAnalysis.components[0]?.explainedVariance ?? 0).toLocaleString(undefined, {
-                      maximumFractionDigits: 1,
-                      style: "percent",
-                    })}{" "}
-                    of variance
-                  </p>
-                </div>
-                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
-                  <p className="text-[11px] uppercase tracking-wide text-[#475569]">PC2</p>
-                  <p className="mt-1 text-sm font-semibold text-[#0F172A]">
-                    PC2 explains {(pcaAnalysis.components[1]?.explainedVariance ?? 0).toLocaleString(undefined, {
-                      maximumFractionDigits: 1,
-                      style: "percent",
-                    })}{" "}
-                    of variance
-                  </p>
-                </div>
+                {pcaAnalysis.components.slice(0, 2).map((component, index) => {
+                  const percent = component.explainedVariance * 100;
+
+                  return (
+                    <div key={component.name} className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
+                      <p className="text-[12px] font-semibold uppercase tracking-wide text-[#475569]">
+                        Principal Component {index + 1}
+                      </p>
+                      <div className="mt-3 h-2.5 overflow-hidden rounded-full bg-[#E2E8F0]">
+                        <div
+                          className="h-full rounded-full bg-[#1F4E8C]"
+                          style={{ width: `${Math.max(0, Math.min(100, percent))}%` }}
+                        />
+                      </div>
+                      <p className="mt-2 text-lg font-semibold text-[#0F172A]">
+                        {percent.toFixed(1)}%
+                      </p>
+                    </div>
+                  );
+                })}
                 <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
                   <p className="text-[11px] uppercase tracking-wide text-[#475569]">Cumulative</p>
                   <p className="mt-1 text-sm font-semibold text-[#0F172A]">
@@ -3032,19 +3104,85 @@ export default function Home() {
                 )}
               </div>
             </div>
-          ) : (
+            ) : (
             <div className="mt-5 rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
               {pcaAnalysis.message}
             </div>
-          )}
+            )}
+          </div>
         </section>
 
         <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div className="max-w-3xl">
-              <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">
-                Correlation Heatmap
+              <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">
+                Sensor Importance Ranking
               </p>
+              <p className="mt-2 text-sm text-[#475569]">
+                Ranked from the existing PCA loading contributions for the current sensor window.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowSensorImportanceRanking((previous) => !previous)}
+              className={`inline-flex shrink-0 items-center justify-center rounded-lg border px-4 py-2 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-blue-100 focus:ring-offset-2 ${
+                showSensorImportanceRanking
+                  ? "border-[#1F4E8C] bg-[#1F4E8C] text-white hover:bg-[#173B69]"
+                  : "border-[#1F4E8C] bg-white text-[#1F4E8C] hover:bg-[#EFF6FF]"
+              }`}
+              aria-expanded={showSensorImportanceRanking}
+            >
+              {showSensorImportanceRanking ? "Hide Sensor Importance Ranking" : "Show Sensor Importance Ranking"}
+            </button>
+          </div>
+
+          <div
+            className={`overflow-hidden transition-all duration-300 ease-in-out ${
+              showSensorImportanceRanking ? "mt-5 max-h-[560px] opacity-100" : "mt-0 max-h-0 opacity-0"
+            }`}
+          >
+          {pcaSensorImportance.length > 0 ? (
+            <div className="space-y-3">
+              {pcaSensorImportance.map((item) => (
+                <div key={`importance-${item.sensor}`} className="grid gap-2 rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3 sm:grid-cols-[160px_1fr_56px] sm:items-center">
+                  <p className="font-semibold text-[#0F172A]">
+                    {correlationSensorLabelByKey[item.sensor]}
+                  </p>
+                  <div className="h-2.5 overflow-hidden rounded-full bg-[#E2E8F0]">
+                    <div
+                      className="h-full rounded-full bg-[#1F4E8C]"
+                      style={{ width: `${item.scorePercent}%` }}
+                    />
+                  </div>
+                  <p className="text-right font-mono text-sm font-semibold text-[#1F4E8C]">
+                    {item.scorePercent}%
+                  </p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+              Sensor importance ranking requires a valid PCA result.
+            </div>
+          )}
+          </div>
+        </section>
+
+        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="max-w-3xl">
+              <div className="flex items-center gap-2">
+                <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">
+                  Correlation Heatmap
+                </p>
+                <span
+                  className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-[#D8E0EA] bg-[#F8FAFC] text-[11px] font-bold text-[#607D8B]"
+                  title={`Bucket size: ${correlationHeatmapData.bucketSizeLabel}`}
+                  aria-label={`Bucket size: ${correlationHeatmapData.bucketSizeLabel}`}
+                >
+                  i
+                </span>
+              </div>
               <p className="mt-2 text-sm text-[#475569]">
                 The heatmap provides an immediate visual summary of relationships between all sensors.
                 It complements the correlation table by making patterns easier to recognize.
@@ -3055,8 +3193,8 @@ export default function Home() {
               onClick={() => setShowCorrelationHeatmap((previous) => !previous)}
               className={`inline-flex shrink-0 items-center justify-center rounded-lg border px-4 py-2 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-blue-100 focus:ring-offset-2 ${
                 showCorrelationHeatmap
-                  ? "border-[#1E3A8A] bg-[#1E3A8A] text-white hover:bg-[#172554]"
-                  : "border-[#1E3A8A] bg-white text-[#1E3A8A] hover:bg-[#EFF6FF]"
+                  ? "border-[#1F4E8C] bg-[#1F4E8C] text-white hover:bg-[#173B69]"
+                  : "border-[#1F4E8C] bg-white text-[#1F4E8C] hover:bg-[#EFF6FF]"
               }`}
               aria-expanded={showCorrelationHeatmap}
             >
@@ -3074,10 +3212,10 @@ export default function Home() {
                 Not enough data to generate heatmap.
               </div>
             ) : (
-              <div className="space-y-4">
+              <div className="space-y-5">
                 <div className="overflow-x-auto rounded-lg border border-[#D8E0EA]">
                   <div
-                    className="grid min-w-[520px] bg-[#D8E0EA] text-xs"
+                    className="grid min-w-[540px] gap-px bg-[#D8E0EA] text-xs"
                     style={{
                       gridTemplateColumns: `minmax(92px, 0.9fr) repeat(${correlationHeatmapData.sensors.length}, minmax(78px, 1fr))`,
                     }}
@@ -3094,7 +3232,7 @@ export default function Home() {
 
                     {correlationHeatmapData.sensors.map((rowKey) => (
                       <div key={`heatmap-row-${rowKey}`} className="contents">
-                        <div className="bg-[#F8FAFC] px-3 py-3 font-semibold text-[#475569]">
+                        <div className="bg-[#F8FAFC] px-3 py-4 font-semibold text-[#475569]">
                           {correlationSensorLabelByKey[rowKey]}
                         </div>
                         {correlationHeatmapData.sensors.map((columnKey) => {
@@ -3115,7 +3253,7 @@ export default function Home() {
                           return (
                             <div
                               key={`heatmap-cell-${rowKey}-${columnKey}`}
-                              className={`flex min-h-14 items-center justify-center border-l border-t border-white px-2 py-3 text-center font-mono text-sm font-semibold tabular-nums ${
+                              className={`flex min-h-14 items-center justify-center px-2 py-3 text-center font-mono text-sm font-semibold tabular-nums transition-transform duration-150 hover:relative hover:z-10 hover:scale-[1.03] hover:ring-2 hover:ring-[#1F4E8C]/30 ${
                                 isStrong ? "text-white" : "text-[#0F172A]"
                               }`}
                               style={{
@@ -3134,9 +3272,6 @@ export default function Home() {
                 </div>
 
                 <div className="flex flex-col gap-2 text-xs text-[#475569] sm:flex-row sm:items-center sm:justify-between">
-                  <div className="font-medium text-[#475569]">
-                    Bucket size: {correlationHeatmapData.bucketSizeLabel}
-                  </div>
                   <div className="flex items-center gap-2">
                     <span className="font-medium text-[#475569]">Strong Negative</span>
                     <span>{"<-"}</span>
@@ -3161,7 +3296,7 @@ export default function Home() {
 
         <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
           <div className="max-w-3xl">
-            <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">
+            <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">
               Research Methods Used
             </p>
             <p className="mt-2 text-sm text-[#475569]">
@@ -3210,7 +3345,7 @@ export default function Home() {
                   className="rounded-lg border border-[#D8E0EA] bg-white p-5"
                 >
                   <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#D8E0EA] bg-[#F8FAFC]">
-                    <Icon className="h-4 w-4 text-[#1E3A8A]" aria-hidden="true" />
+                    <Icon className="h-4 w-4 text-[#1F4E8C]" aria-hidden="true" />
                   </div>
                   <h3 className="mt-4 text-sm font-semibold text-[#0F172A]">
                     {method.title}
@@ -3225,10 +3360,39 @@ export default function Home() {
         </section>
 
         <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
-          <p className="text-xs font-semibold uppercase tracking-wide text-[#1E3A8A]">Recommended Action</p>
-          <p className="mt-2 text-xl font-semibold text-[#0F172A]">{engineeringDecision.recommendation}</p>
-          <p className="mt-2 text-sm text-[#475569]">Confidence: {aiAnalysis.confidence}%</p>
+          <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">Recommended Action</p>
+          <p className="mt-3 text-xl font-semibold text-[#0F172A]">{engineeringDecision.recommendation}</p>
+          <div className="mt-5 grid gap-3 sm:grid-cols-3">
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-[#607D8B]">Priority</p>
+              <span
+                className={`mt-2 inline-flex rounded-full border px-3 py-1 text-xs font-bold ${
+                  recommendedPriority === "HIGH"
+                    ? "border-[#F0B4B4] bg-[#FDECEC] text-[#C62828]"
+                    : recommendedPriority === "MEDIUM"
+                      ? "border-[#F9D66B] bg-[#FFF8E1] text-[#B45309]"
+                      : "border-[#A5D6A7] bg-[#F1F8E9] text-[#2E7D32]"
+                }`}
+              >
+                {recommendedPriority}
+              </span>
+            </div>
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-[#607D8B]">Confidence</p>
+              <p className="mt-2 text-lg font-bold text-[#1F4E8C]">{aiAnalysis.confidence}%</p>
+            </div>
+            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-[#607D8B]">Estimated Impact</p>
+              <span className="mt-2 inline-flex rounded-full border border-[#BBD4F0] bg-[#EFF6FF] px-3 py-1 text-xs font-bold text-[#1F4E8C]">
+                {recommendedImpact}
+              </span>
+            </div>
+          </div>
         </section>
+        <footer className="pb-2 pt-1 text-center text-xs leading-6 text-[#607D8B]">
+          <p className="font-semibold text-[#475569]">Robot Engineering Decision Support Dashboard</p>
+          <p>Research Prototype · Version 1.0 · 2026</p>
+        </footer>
       </div>
     </main>
   );
