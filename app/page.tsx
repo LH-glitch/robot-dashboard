@@ -19,7 +19,10 @@ import {
   Legend,
   Line,
   LineChart,
+  ReferenceLine,
   ResponsiveContainer,
+  Scatter,
+  ScatterChart,
   Tooltip,
   XAxis,
   YAxis,
@@ -99,6 +102,14 @@ type PcaComponentSummary = {
   cumulativeVariance: number;
   topContributors: ComparisonSensorKey[];
   contributorScores: Array<{ sensor: ComparisonSensorKey; score: number }>;
+  loadings: Array<{ sensor: ComparisonSensorKey; loading: number }>;
+};
+
+type PcaScorePoint = {
+  pc1: number;
+  pc2: number;
+  bucketStartMs: number;
+  bucketEndMs: number;
 };
 
 type PcaDiagnostics = {
@@ -119,6 +130,7 @@ type PcaAnalysisResult =
       observations: number;
       sensors: ComparisonSensorKey[];
       components: PcaComponentSummary[];
+      pcaScores: PcaScorePoint[];
       diagnostics: PcaDiagnostics;
     }
   | {
@@ -791,6 +803,9 @@ function buildAlignedSensorObservations(
     Partial<Record<ComparisonSensorKey, { value: number; deltaFromCenterMs: number }>>
   >();
 
+  // Robot telemetry arrives asynchronously over MQTT, so temperature, humidity,
+  // pressure, distance, and acceleration rarely share exact timestamps. Bucket
+  // alignment creates PCA-ready observations without changing the sensor values.
   for (const record of records) {
     const sensorDef = COMPARISON_SENSOR_DEFINITIONS.find((definition) =>
       definition.aliases.includes(record.sensor),
@@ -922,6 +937,9 @@ function calculatePcaAnalysis(
     };
   }
 
+  // Each robot sensor uses different units and ranges (pressure near 1000,
+  // temperature near 20-30, humidity near 50-70, distance and acceleration on
+  // their own scales), so every usable column is standardized before PCA.
   const presentValuesBySensor = candidateSensors.map((sensorKey) =>
     pcaRows
       .map((row) => row.values[sensorKey])
@@ -976,7 +994,8 @@ function calculatePcaAnalysis(
   const standardizedRows = pcaRows.map((row) =>
     validColumnIndexes.map((columnIndex) => {
       const value = row.values[candidateSensors[columnIndex]];
-      // Bucketed telemetry can be sparse; mean-fill keeps rows usable after sensor selection.
+      // Mean-fill happens only after usable sensors are selected; this keeps
+      // sparse bucketed robot telemetry usable while preserving column means.
       const filledValue = typeof value === "number" ? value : means[columnIndex];
       return (filledValue - means[columnIndex]) / standardDeviations[columnIndex];
     }),
@@ -1040,9 +1059,18 @@ function calculatePcaAnalysis(
         score: Math.abs(loading),
       }))
       .sort((left, right) => right.score - left.score);
-    const topContributors = contributorScores
-      .slice(0, 3)
+    const loadings = pair.eigenvector.map((loading, sensorIndex) => ({
+      sensor: sensors[sensorIndex],
+      loading,
+    }));
+    const strongestLoading = contributorScores[0]?.score ?? 0;
+    const dominantContributors = contributorScores
+      .filter((item) => strongestLoading > 0 && item.score >= strongestLoading * 0.8)
       .map((item) => item.sensor);
+    const topContributors =
+      dominantContributors.length > 0
+        ? dominantContributors
+        : contributorScores.slice(0, 1).map((item) => item.sensor);
 
     return {
       name: `PC${index + 1}`,
@@ -1050,14 +1078,24 @@ function calculatePcaAnalysis(
       cumulativeVariance,
       topContributors,
       contributorScores,
+      loadings,
     };
   });
+  const pc1Vector = eigenPairs[0]?.eigenvector ?? [];
+  const pc2Vector = eigenPairs[1]?.eigenvector ?? [];
+  const pcaScores = standardizedRows.map((row, rowIndex) => ({
+    pc1: row.reduce((sum, value, columnIndex) => sum + value * (pc1Vector[columnIndex] ?? 0), 0),
+    pc2: row.reduce((sum, value, columnIndex) => sum + value * (pc2Vector[columnIndex] ?? 0), 0),
+    bucketStartMs: pcaRows[rowIndex].bucketStartMs,
+    bucketEndMs: pcaRows[rowIndex].bucketEndMs,
+  }));
 
   return {
     status: "ok",
     observations: standardizedRows.length,
     sensors,
     components,
+    pcaScores,
     diagnostics,
   };
 }
@@ -1108,7 +1146,7 @@ export default function Home() {
   const [hoveredHeatmapCell, setHoveredHeatmapCell] = useState<HeatmapHoverInfo | null>(null);
   const [heatmapViewMode, setHeatmapViewMode] = useState<HeatmapViewMode>("grid");
   const [showPcaAnalysis, setShowPcaAnalysis] = useState(false);
-  const [showSensorImportanceRanking, setShowSensorImportanceRanking] = useState(false);
+  const [showPcaBiplot, setShowPcaBiplot] = useState(false);
   const [showCorrelationHeatmap, setShowCorrelationHeatmap] = useState(false);
   const [selectedOverlaySensors, setSelectedOverlaySensors] = useState<ComparisonSensorKey[]>([]);
   const [normalizeOverlay, setNormalizeOverlay] = useState(false);
@@ -2294,17 +2332,209 @@ export default function Home() {
         )}.`
       : null;
 
-  const pcaSensorImportance = useMemo(() => {
-    if (pcaAnalysis.status !== "ok") return [];
+  const pcaBiplotData = useMemo(() => {
+    if (pcaAnalysis.status !== "ok" || pcaAnalysis.components.length < 2) return null;
 
-    const pc1Scores = pcaAnalysis.components[0]?.contributorScores ?? [];
-    const maxScore = Math.max(...pc1Scores.map((item) => item.score), 0);
+    const sensorColorByKey: Record<ComparisonSensorKey, string> = {
+      temperature: "#C62828",
+      humidity: "#1F4E8C",
+      pressure: "#2E7D32",
+      distance: "#EA580C",
+      accel: "#7E22CE",
+    };
+    const pc1 = pcaAnalysis.components[0];
+    const pc2 = pcaAnalysis.components[1];
+    const scoreExtent = Math.max(
+      ...pcaAnalysis.pcaScores.flatMap((score) => [Math.abs(score.pc1), Math.abs(score.pc2)]),
+      1,
+    );
+    const vectorScale = Math.max(scoreExtent * 0.75, 1);
+    const vectors = pcaAnalysis.sensors.map((sensorKey) => {
+      const pc1Loading = pc1.loadings.find((loading) => loading.sensor === sensorKey)?.loading ?? 0;
+      const pc2Loading = pc2.loadings.find((loading) => loading.sensor === sensorKey)?.loading ?? 0;
+      const x = pc1Loading * vectorScale;
+      const y = pc2Loading * vectorScale;
 
-    return pc1Scores.map((item) => ({
-      sensor: item.sensor,
-      scorePercent: maxScore > 0 ? Math.round((item.score / maxScore) * 100) : 0,
-    }));
-  }, [pcaAnalysis]);
+      return {
+        sensor: sensorKey,
+        label: correlationSensorLabelByKey[sensorKey],
+        pc1: x,
+        pc2: y,
+        color: sensorColorByKey[sensorKey],
+        angle: Math.atan2(-y, x) * (180 / Math.PI),
+      };
+    });
+    const chartExtent = Math.max(
+      ...pcaAnalysis.pcaScores.flatMap((score) => [Math.abs(score.pc1), Math.abs(score.pc2)]),
+      ...vectors.flatMap((vector) => [Math.abs(vector.pc1), Math.abs(vector.pc2)]),
+      1,
+    ) * 1.18;
+    const labelOffset = chartExtent * 0.07;
+    const collisionOffset = chartExtent * 0.075;
+    const minimumLabelDistance = chartExtent * 0.16;
+    const similarAngleThreshold = (12 * Math.PI) / 180;
+    const labelPadding = chartExtent * 0.05;
+    const clampToChart = (value: number) =>
+      Math.max(-chartExtent + labelPadding, Math.min(chartExtent - labelPadding, value));
+    const angleDistance = (left: number, right: number) => {
+      const difference = Math.abs(left - right) % (2 * Math.PI);
+      return difference > Math.PI ? 2 * Math.PI - difference : difference;
+    };
+    const placedLabels: Array<{ pc1: number; pc2: number; angle: number }> = [];
+    const labelPoints = vectors.map((vector, index) => {
+      const length = Math.hypot(vector.pc1, vector.pc2) || 1;
+      const normalizedX = vector.pc1 / length;
+      const normalizedY = vector.pc2 / length;
+      const perpendicularX = -normalizedY;
+      const perpendicularY = normalizedX;
+      const angle = Math.atan2(vector.pc2, vector.pc1);
+      let labelPc1 = vector.pc1 + normalizedX * labelOffset;
+      let labelPc2 = vector.pc2 + normalizedY * labelOffset;
+      let collisionIndex = 0;
+
+      for (const placedLabel of placedLabels) {
+        const distance = Math.hypot(labelPc1 - placedLabel.pc1, labelPc2 - placedLabel.pc2);
+        const similarAngle = angleDistance(angle, placedLabel.angle) < similarAngleThreshold;
+
+        if (distance < minimumLabelDistance || similarAngle) {
+          collisionIndex += similarAngle ? 2 : 1;
+        }
+      }
+
+      if (collisionIndex > 0) {
+        const side = index % 2 === 0 ? 1 : -1;
+        labelPc1 += perpendicularX * collisionOffset * collisionIndex * side;
+        labelPc2 += perpendicularY * collisionOffset * collisionIndex * side;
+      }
+
+      labelPc1 = clampToChart(labelPc1);
+      labelPc2 = clampToChart(labelPc2);
+      placedLabels.push({ pc1: labelPc1, pc2: labelPc2, angle });
+
+      const anchor =
+        Math.abs(normalizedX) < 0.25
+          ? "middle"
+          : normalizedX > 0
+            ? "start"
+            : "end";
+
+      return {
+        ...vector,
+        pc1: labelPc1,
+        pc2: labelPc2,
+        endpointPc1: vector.pc1,
+        endpointPc2: vector.pc2,
+        textAnchor: anchor,
+        showConnector: Math.hypot(labelPc1 - vector.pc1, labelPc2 - vector.pc2) > labelOffset * 1.35,
+      };
+    });
+
+    return {
+      scores: pcaAnalysis.pcaScores,
+      vectors,
+      labelPoints,
+      chartExtent,
+      pc1Variance: pc1.explainedVariance,
+      pc2Variance: pc2.explainedVariance,
+    };
+  }, [correlationSensorLabelByKey, pcaAnalysis]);
+
+  const renderPcaScoreTooltip = (props: unknown) => {
+    const { active, payload } = props as {
+      active?: boolean;
+      payload?: ReadonlyArray<{ payload: Partial<PcaScorePoint> }>;
+    };
+    if (!active || !payload?.length) return null;
+
+    const point = payload[0].payload;
+    if (
+      typeof point.bucketStartMs !== "number" ||
+      typeof point.bucketEndMs !== "number" ||
+      typeof point.pc1 !== "number" ||
+      typeof point.pc2 !== "number"
+    ) {
+      return null;
+    }
+
+    return (
+      <div className="rounded-lg border border-[#D8E0EA] bg-white px-3 py-2 text-xs shadow-sm">
+        <p className="font-semibold text-[#0F172A]">
+          {new Date(point.bucketStartMs).toLocaleString()} - {new Date(point.bucketEndMs).toLocaleString()}
+        </p>
+        <p className="mt-1 text-[#475569]">PC1 score: {point.pc1.toFixed(3)}</p>
+        <p className="text-[#475569]">PC2 score: {point.pc2.toFixed(3)}</p>
+      </div>
+    );
+  };
+
+  const renderPcaVectorArrow = (props: unknown) => {
+    const { cx, cy, payload } = props as {
+      cx?: number;
+      cy?: number;
+      payload?: { color: string; angle: number };
+    };
+
+    if (typeof cx !== "number" || typeof cy !== "number" || !payload) return null;
+
+    return (
+      <path
+        d="M -1 -5 L 10 0 L -1 5 Z"
+        fill={payload.color}
+        transform={`translate(${cx} ${cy}) rotate(${payload.angle})`}
+      />
+    );
+  };
+
+  const renderPcaVectorLabel = (props: unknown) => {
+    const { cx, cy, payload } = props as {
+      cx?: number;
+      cy?: number;
+      payload?: { label: string; color: string; textAnchor: "start" | "middle" | "end" };
+    };
+
+    if (typeof cx !== "number" || typeof cy !== "number" || !payload) return null;
+
+    const width = payload.label.length * 7 + 14;
+    const height = 20;
+    const rectX =
+      payload.textAnchor === "start"
+        ? 5
+        : payload.textAnchor === "end"
+          ? -width - 5
+          : -width / 2;
+    const textX =
+      payload.textAnchor === "start"
+        ? 11
+        : payload.textAnchor === "end"
+          ? -11
+          : 0;
+
+    return (
+      <g transform={`translate(${cx} ${cy})`}>
+        <rect
+          x={rectX}
+          y={-height / 2}
+          width={width}
+          height={height}
+          rx={4}
+          fill="#FFFFFF"
+          stroke="#D8E0EA"
+          opacity={0.96}
+        />
+        <circle cx={rectX + 5} cy={0} r={2.5} fill={payload.color} />
+        <text
+          x={textX}
+          y={4}
+          textAnchor={payload.textAnchor}
+          fill="#0F172A"
+          fontSize={12}
+          fontWeight={600}
+        >
+          {payload.label}
+        </text>
+      </g>
+    );
+  };
 
   const getDirectionColorClass = (label: string) => {
     if (label === "Rising") return "text-[#2E7D32]";
@@ -3071,7 +3301,7 @@ export default function Home() {
                         Component
                       </th>
                       <th className="px-4 py-3 font-semibold text-[#475569]" scope="col">
-                        Top Contributors
+                        Dominant Contributors
                       </th>
                     </tr>
                   </thead>
@@ -3116,55 +3346,167 @@ export default function Home() {
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div className="max-w-3xl">
               <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">
-                Sensor Importance Ranking
+                PCA Biplot
               </p>
               <p className="mt-2 text-sm text-[#475569]">
-                Ranked from the existing PCA loading contributions for the current sensor window.
+                Observation projection and sensor loading directions
+              </p>
+              <p className="mt-3 text-sm leading-6 text-[#475569]">
+                The PCA biplot shows robot operating states as points and sensor contributions as vectors.
+                Points that are close together represent similar telemetry behavior. Sensor arrows show
+                which variables most influence the principal components.
               </p>
             </div>
             <button
               type="button"
-              onClick={() => setShowSensorImportanceRanking((previous) => !previous)}
+              onClick={() => setShowPcaBiplot((previous) => !previous)}
               className={`inline-flex shrink-0 items-center justify-center rounded-lg border px-4 py-2 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-blue-100 focus:ring-offset-2 ${
-                showSensorImportanceRanking
+                showPcaBiplot
                   ? "border-[#1F4E8C] bg-[#1F4E8C] text-white hover:bg-[#173B69]"
                   : "border-[#1F4E8C] bg-white text-[#1F4E8C] hover:bg-[#EFF6FF]"
               }`}
-              aria-expanded={showSensorImportanceRanking}
+              aria-expanded={showPcaBiplot}
             >
-              {showSensorImportanceRanking ? "Hide Sensor Importance Ranking" : "Show Sensor Importance Ranking"}
+              {showPcaBiplot ? "Hide PCA Biplot" : "Show PCA Biplot"}
             </button>
           </div>
 
           <div
             className={`overflow-hidden transition-all duration-300 ease-in-out ${
-              showSensorImportanceRanking ? "mt-5 max-h-[560px] opacity-100" : "mt-0 max-h-0 opacity-0"
+              showPcaBiplot ? "mt-5 max-h-[920px] opacity-100" : "mt-0 max-h-0 opacity-0"
             }`}
           >
-          {pcaSensorImportance.length > 0 ? (
-            <div className="space-y-3">
-              {pcaSensorImportance.map((item) => (
-                <div key={`importance-${item.sensor}`} className="grid gap-2 rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3 sm:grid-cols-[160px_1fr_56px] sm:items-center">
-                  <p className="font-semibold text-[#0F172A]">
-                    {correlationSensorLabelByKey[item.sensor]}
-                  </p>
-                  <div className="h-2.5 overflow-hidden rounded-full bg-[#E2E8F0]">
-                    <div
-                      className="h-full rounded-full bg-[#1F4E8C]"
-                      style={{ width: `${item.scorePercent}%` }}
-                    />
+            {pcaAnalysis.status !== "ok" ? (
+              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+                {pcaAnalysis.message}
+              </div>
+            ) : pcaAnalysis.components.length < 2 ? (
+              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+                PCA biplot requires PC1 and PC2.
+              </div>
+            ) : pcaAnalysis.pcaScores.length < 3 ? (
+              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+                Not enough observations to draw PCA biplot.
+              </div>
+            ) : pcaBiplotData ? (
+              <div className="space-y-4">
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] p-4">
+                  <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-[#0F172A]">
+                        PCA Biplot: Robot States and Sensor Loadings
+                      </p>
+                      <p className="text-xs text-[#475569]">
+                        Scores are projected observations; vectors are signed sensor loadings.
+                      </p>
+                    </div>
                   </div>
-                  <p className="text-right font-mono text-sm font-semibold text-[#1F4E8C]">
-                    {item.scorePercent}%
-                  </p>
+                  <div className="h-[360px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <ScatterChart margin={{ top: 18, right: 28, bottom: 34, left: 12 }}>
+                        <CartesianGrid stroke="#E2E8F0" strokeDasharray="3 3" />
+                        <XAxis
+                          type="number"
+                          dataKey="pc1"
+                          domain={[-pcaBiplotData.chartExtent, pcaBiplotData.chartExtent]}
+                          tick={{ fill: "#475569", fontSize: 12 }}
+                          tickLine={{ stroke: "#CBD5E1" }}
+                          axisLine={{ stroke: "#CBD5E1" }}
+                          label={{
+                            value: `PC1 Score (${(pcaBiplotData.pc1Variance * 100).toFixed(1)}% variance)`,
+                            position: "insideBottom",
+                            offset: -24,
+                            fill: "#475569",
+                            fontSize: 12,
+                            fontWeight: 600,
+                          }}
+                        />
+                        <YAxis
+                          type="number"
+                          dataKey="pc2"
+                          domain={[-pcaBiplotData.chartExtent, pcaBiplotData.chartExtent]}
+                          tick={{ fill: "#475569", fontSize: 12 }}
+                          tickLine={{ stroke: "#CBD5E1" }}
+                          axisLine={{ stroke: "#CBD5E1" }}
+                          label={{
+                            value: `PC2 Score (${(pcaBiplotData.pc2Variance * 100).toFixed(1)}% variance)`,
+                            angle: -90,
+                            position: "insideLeft",
+                            fill: "#475569",
+                            fontSize: 12,
+                            fontWeight: 600,
+                          }}
+                        />
+                        <Tooltip content={renderPcaScoreTooltip} cursor={{ stroke: "#94A3B8", strokeDasharray: "3 3" }} />
+                        <ReferenceLine x={0} stroke="#94A3B8" strokeDasharray="4 4" />
+                        <ReferenceLine y={0} stroke="#94A3B8" strokeDasharray="4 4" />
+                        <Scatter
+                          name="Robot states"
+                          data={pcaBiplotData.scores}
+                          fill="#1F4E8C"
+                          fillOpacity={0.62}
+                          isAnimationActive={false}
+                        />
+                        {pcaBiplotData.vectors.map((vector) => (
+                          <Scatter
+                            key={`pca-vector-line-${vector.sensor}`}
+                            data={[
+                              { pc1: 0, pc2: 0 },
+                              { pc1: vector.pc1, pc2: vector.pc2 },
+                            ]}
+                            line={{ stroke: vector.color, strokeWidth: 2 }}
+                            shape={() => null}
+                            isAnimationActive={false}
+                          />
+                        ))}
+                        <Scatter
+                          name="Sensor loadings"
+                          data={pcaBiplotData.vectors}
+                          shape={renderPcaVectorArrow}
+                          isAnimationActive={false}
+                        />
+                        {pcaBiplotData.labelPoints
+                          .filter((labelPoint) => labelPoint.showConnector)
+                          .map((labelPoint) => (
+                            <Scatter
+                              key={`pca-label-connector-${labelPoint.sensor}`}
+                              data={[
+                                { pc1: labelPoint.endpointPc1, pc2: labelPoint.endpointPc2 },
+                                { pc1: labelPoint.pc1, pc2: labelPoint.pc2 },
+                              ]}
+                              line={{ stroke: "#94A3B8", strokeWidth: 1, strokeDasharray: "3 3" }}
+                              shape={() => null}
+                              isAnimationActive={false}
+                            />
+                          ))}
+                        <Scatter
+                          name="Sensor labels"
+                          data={pcaBiplotData.labelPoints}
+                          shape={renderPcaVectorLabel}
+                          isAnimationActive={false}
+                        />
+                      </ScatterChart>
+                    </ResponsiveContainer>
+                  </div>
                 </div>
-              ))}
-            </div>
-          ) : (
-            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
-              Sensor importance ranking requires a valid PCA result.
-            </div>
-          )}
+
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3 text-sm text-[#475569]">
+                  <p className="font-semibold text-[#0F172A]">How to read this graph:</p>
+                  <ul className="mt-2 grid gap-1 sm:grid-cols-2">
+                    <li>Points close together represent similar robot states.</li>
+                    <li>Points far apart represent different behavior or possible anomalies.</li>
+                    <li>Longer arrows mean stronger sensor contribution.</li>
+                    <li>Sensors pointing in the same direction are positively related.</li>
+                    <li>Sensors pointing in opposite directions are negatively related.</li>
+                    <li>Sensors near 90 degrees apart have weak relationship.</li>
+                  </ul>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+                PCA biplot requires PC1 and PC2.
+              </div>
+            )}
           </div>
         </section>
 
