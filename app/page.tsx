@@ -112,18 +112,6 @@ type PcaScorePoint = {
   bucketEndMs: number;
 };
 
-type PcaDiagnostics = {
-  alignedObservations: number;
-  observationsUsed: number;
-  requiredObservations: number;
-  usableSensorCount: number;
-  sensorsUsed: ComparisonSensorKey[];
-  sensorsSkipped: ComparisonSensorKey[];
-  zeroVarianceSensors: ComparisonSensorKey[];
-  bucketSizeLabel: string;
-  failureReason: string | null;
-};
-
 type PcaAnalysisResult =
   | {
       status: "ok";
@@ -131,12 +119,11 @@ type PcaAnalysisResult =
       sensors: ComparisonSensorKey[];
       components: PcaComponentSummary[];
       pcaScores: PcaScorePoint[];
-      diagnostics: PcaDiagnostics;
+      message?: never;
     }
   | {
       status: "insufficient-observations" | "insufficient-sensors" | "failed";
       message: string;
-      diagnostics: PcaDiagnostics;
     };
 
 type CorrelationHeatmapCell = {
@@ -676,6 +663,94 @@ function findNearestValue(
   return bestValue;
 }
 
+function formatDurationMs(durationMs: number): string {
+  if (durationMs < 60 * 1000) return `${Math.round(durationMs / 1000)} sec`;
+  if (durationMs < 60 * 60 * 1000) return `${Math.round(durationMs / (60 * 1000))} min`;
+  if (durationMs < 24 * 60 * 60 * 1000) return `${Math.round(durationMs / (60 * 60 * 1000))} hr`;
+  return `${Math.round(durationMs / (24 * 60 * 60 * 1000))} day`;
+}
+
+function getAdaptiveAlignmentBucketSizeMs(
+  records: Array<SensorRecord & { value: number }>,
+  timeUnit: TimeUnit,
+): number {
+  if (records.length === 0) return 1000;
+
+  const firstTimeMs = records[0].timeMs;
+  const lastTimeMs = records[records.length - 1].timeMs;
+  const rangeMs = Math.max(0, lastTimeMs - firstTimeMs);
+
+  if (timeUnit === "seconds") return 1000;
+  if (timeUnit === "minutes") return rangeMs <= 2 * 60 * 1000 ? 1000 : 5 * 1000;
+  if (timeUnit === "hours") return 60 * 1000;
+  if (timeUnit === "days") return rangeMs <= 3 * 24 * 60 * 60 * 1000 ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  return rangeMs <= 2 * 24 * 60 * 60 * 1000 ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+}
+
+function buildAlignedSensorObservations(
+  records: Array<SensorRecord & { value: number }>,
+  timeUnit: TimeUnit,
+): AlignedSensorData {
+  const bucketSizeMs = getAdaptiveAlignmentBucketSizeMs(records, timeUnit);
+  const bucketMap = new Map<
+    number,
+    Partial<Record<ComparisonSensorKey, { value: number; deltaFromCenterMs: number }>>
+  >();
+
+  // Robot telemetry arrives asynchronously over MQTT, so temperature, humidity,
+  // pressure, distance, and acceleration rarely share exact timestamps. Bucket
+  // alignment creates heatmap-ready observations without changing sensor values.
+  for (const record of records) {
+    const sensorDef = COMPARISON_SENSOR_DEFINITIONS.find((definition) =>
+      definition.aliases.includes(record.sensor),
+    );
+
+    if (!sensorDef) {
+      continue;
+    }
+
+    const bucketIndex = Math.floor(record.timeMs / bucketSizeMs);
+    const bucketStartMs = bucketIndex * bucketSizeMs;
+    const bucketCenterMs = bucketStartMs + bucketSizeMs / 2;
+    const deltaFromCenterMs = Math.abs(record.timeMs - bucketCenterMs);
+    const bucket = bucketMap.get(bucketStartMs) ?? {};
+    const previous = bucket[sensorDef.key];
+
+    if (!previous || deltaFromCenterMs < previous.deltaFromCenterMs) {
+      bucket[sensorDef.key] = {
+        value: record.value,
+        deltaFromCenterMs,
+      };
+    }
+
+    bucketMap.set(bucketStartMs, bucket);
+  }
+
+  const rows = Array.from(bucketMap.entries())
+    .map(([bucketStartMs, bucket]) => {
+      const values = Object.fromEntries(
+        Object.entries(bucket).map(([sensorKey, point]) => [
+          sensorKey,
+          point?.value,
+        ]),
+      ) as Partial<Record<ComparisonSensorKey, number>>;
+
+      return {
+        bucketStartMs,
+        bucketEndMs: bucketStartMs + bucketSizeMs,
+        values,
+      };
+    })
+    .filter((row) => Object.values(row.values).filter((value) => typeof value === "number").length >= 2)
+    .sort((a, b) => a.bucketStartMs - b.bucketStartMs);
+
+  return {
+    rows,
+    bucketSizeMs,
+    bucketSizeLabel: formatDurationMs(bucketSizeMs),
+  };
+}
+
 function calculateMean(values: number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
@@ -769,107 +844,7 @@ function jacobiEigenDecomposition(
   return { eigenvalues, eigenvectors };
 }
 
-function formatDurationMs(durationMs: number): string {
-  if (durationMs < 60 * 1000) return `${Math.round(durationMs / 1000)} sec`;
-  if (durationMs < 60 * 60 * 1000) return `${Math.round(durationMs / (60 * 1000))} min`;
-  if (durationMs < 24 * 60 * 60 * 1000) return `${Math.round(durationMs / (60 * 60 * 1000))} hr`;
-  return `${Math.round(durationMs / (24 * 60 * 60 * 1000))} day`;
-}
-
-function getAdaptiveAlignmentBucketSizeMs(
-  records: Array<SensorRecord & { value: number }>,
-  timeUnit: TimeUnit,
-): number {
-  if (records.length === 0) return 1000;
-
-  const firstTimeMs = records[0].timeMs;
-  const lastTimeMs = records[records.length - 1].timeMs;
-  const rangeMs = Math.max(0, lastTimeMs - firstTimeMs);
-
-  if (timeUnit === "seconds") return 1000;
-  if (timeUnit === "minutes") return rangeMs <= 2 * 60 * 1000 ? 1000 : 5 * 1000;
-  if (timeUnit === "hours") return 60 * 1000;
-  if (timeUnit === "days") return rangeMs <= 3 * 24 * 60 * 60 * 1000 ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
-  return rangeMs <= 2 * 24 * 60 * 60 * 1000 ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
-}
-
-function buildAlignedSensorObservations(
-  records: Array<SensorRecord & { value: number }>,
-  timeUnit: TimeUnit,
-): AlignedSensorData {
-  const bucketSizeMs = getAdaptiveAlignmentBucketSizeMs(records, timeUnit);
-  const bucketMap = new Map<
-    number,
-    Partial<Record<ComparisonSensorKey, { value: number; deltaFromCenterMs: number }>>
-  >();
-
-  // Robot telemetry arrives asynchronously over MQTT, so temperature, humidity,
-  // pressure, distance, and acceleration rarely share exact timestamps. Bucket
-  // alignment creates PCA-ready observations without changing the sensor values.
-  for (const record of records) {
-    const sensorDef = COMPARISON_SENSOR_DEFINITIONS.find((definition) =>
-      definition.aliases.includes(record.sensor),
-    );
-
-    if (!sensorDef) {
-      continue;
-    }
-
-    const bucketIndex = Math.floor(record.timeMs / bucketSizeMs);
-    const bucketStartMs = bucketIndex * bucketSizeMs;
-    const bucketCenterMs = bucketStartMs + bucketSizeMs / 2;
-    const deltaFromCenterMs = Math.abs(record.timeMs - bucketCenterMs);
-    const bucket = bucketMap.get(bucketStartMs) ?? {};
-    const previous = bucket[sensorDef.key];
-
-    if (!previous || deltaFromCenterMs < previous.deltaFromCenterMs) {
-      bucket[sensorDef.key] = {
-        value: record.value,
-        deltaFromCenterMs,
-      };
-    }
-
-    bucketMap.set(bucketStartMs, bucket);
-  }
-
-  const rows = Array.from(bucketMap.entries())
-    .map(([bucketStartMs, bucket]) => {
-      const values = Object.fromEntries(
-        Object.entries(bucket).map(([sensorKey, point]) => [
-          sensorKey,
-          point?.value,
-        ]),
-      ) as Partial<Record<ComparisonSensorKey, number>>;
-
-      return {
-        bucketStartMs,
-        bucketEndMs: bucketStartMs + bucketSizeMs,
-        values,
-      };
-    })
-    .filter((row) => Object.values(row.values).filter((value) => typeof value === "number").length >= 2)
-    .sort((a, b) => a.bucketStartMs - b.bucketStartMs);
-
-  return {
-    rows,
-    bucketSizeMs,
-    bucketSizeLabel: formatDurationMs(bucketSizeMs),
-  };
-}
-
-function createPcaDiagnosticMessage(diagnostics: PcaDiagnostics): string {
-  const zeroVarianceText =
-    diagnostics.zeroVarianceSensors.length > 0
-      ? diagnostics.zeroVarianceSensors.join(", ")
-      : "none";
-  const reasonText = diagnostics.failureReason ? ` Reason: ${diagnostics.failureReason}` : "";
-
-  return `PCA diagnostics: ${diagnostics.alignedObservations} aligned observations created; ${diagnostics.observationsUsed} observations used, ${diagnostics.requiredObservations} required; ${diagnostics.usableSensorCount} usable sensors; bucket size: ${diagnostics.bucketSizeLabel}; zero-variance sensors removed: ${zeroVarianceText}.${reasonText}`;
-}
-
-function calculatePcaAnalysis(
-  alignedData: AlignedSensorData,
-): PcaAnalysisResult {
+function calculatePcaAnalysis(alignedData: AlignedSensorData): PcaAnalysisResult {
   const REQUIRED_OBSERVATIONS = 3;
   const allSensorKeys = COMPARISON_SENSOR_DEFINITIONS.map((sensorDef) => sensorDef.key);
   const valueCounts = allSensorKeys.reduce<Record<ComparisonSensorKey, number>>(
@@ -892,22 +867,9 @@ function calculatePcaAnalysis(
   );
 
   if (candidateSensors.length < 2) {
-    const diagnostics: PcaDiagnostics = {
-      alignedObservations: alignedData.rows.length,
-      observationsUsed: 0,
-      requiredObservations: REQUIRED_OBSERVATIONS,
-      usableSensorCount: candidateSensors.length,
-      sensorsUsed: candidateSensors,
-      sensorsSkipped: allSensorKeys.filter((key) => !candidateSensors.includes(key)),
-      zeroVarianceSensors: [],
-      bucketSizeLabel: alignedData.bucketSizeLabel,
-      failureReason: "PCA requires at least two sensors with three aligned values.",
-    };
-
     return {
       status: "insufficient-sensors",
-      message: createPcaDiagnosticMessage(diagnostics),
-      diagnostics,
+      message: "PCA requires at least two sensors with three aligned values.",
     };
   }
 
@@ -918,28 +880,12 @@ function calculatePcaAnalysis(
   );
 
   if (pcaRows.length < REQUIRED_OBSERVATIONS) {
-    const diagnostics: PcaDiagnostics = {
-      alignedObservations: alignedData.rows.length,
-      observationsUsed: pcaRows.length,
-      requiredObservations: REQUIRED_OBSERVATIONS,
-      usableSensorCount: candidateSensors.length,
-      sensorsUsed: candidateSensors,
-      sensorsSkipped: allSensorKeys.filter((key) => !candidateSensors.includes(key)),
-      zeroVarianceSensors: [],
-      bucketSizeLabel: alignedData.bucketSizeLabel,
-      failureReason: "Not enough bucketed rows contain at least two usable sensor values.",
-    };
-
     return {
       status: "insufficient-observations",
-      message: createPcaDiagnosticMessage(diagnostics),
-      diagnostics,
+      message: "Not enough bucketed rows contain at least two usable sensor values.",
     };
   }
 
-  // Each robot sensor uses different units and ranges (pressure near 1000,
-  // temperature near 20-30, humidity near 50-70, distance and acceleration on
-  // their own scales), so every usable column is standardized before PCA.
   const presentValuesBySensor = candidateSensors.map((sensorKey) =>
     pcaRows
       .map((row) => row.values[sensorKey])
@@ -953,49 +899,18 @@ function calculatePcaAnalysis(
     .map((standardDeviation, index) => ({ standardDeviation, index }))
     .filter(({ standardDeviation }) => standardDeviation > 0 && Number.isFinite(standardDeviation))
     .map(({ index }) => index);
-  const zeroVarianceSensors = standardDeviations
-    .map((standardDeviation, index) => ({ standardDeviation, sensor: candidateSensors[index] }))
-    .filter(({ standardDeviation }) => standardDeviation === 0 || !Number.isFinite(standardDeviation))
-    .map(({ sensor }) => sensor);
 
   if (validColumnIndexes.length < 2) {
-    const sensorsUsed = validColumnIndexes.map((columnIndex) => candidateSensors[columnIndex]);
-    const diagnostics: PcaDiagnostics = {
-      alignedObservations: alignedData.rows.length,
-      observationsUsed: pcaRows.length,
-      requiredObservations: REQUIRED_OBSERVATIONS,
-      usableSensorCount: sensorsUsed.length,
-      sensorsUsed,
-      sensorsSkipped: allSensorKeys.filter((key) => !sensorsUsed.includes(key)),
-      zeroVarianceSensors,
-      bucketSizeLabel: alignedData.bucketSizeLabel,
-      failureReason: "Fewer than two usable sensors remain after removing zero-variance columns.",
-    };
-
     return {
       status: "insufficient-sensors",
-      message: createPcaDiagnosticMessage(diagnostics),
-      diagnostics,
+      message: "Fewer than two usable sensors remain after removing zero-variance columns.",
     };
   }
 
   const sensors = validColumnIndexes.map((columnIndex) => candidateSensors[columnIndex]);
-  const diagnostics: PcaDiagnostics = {
-    alignedObservations: alignedData.rows.length,
-    observationsUsed: pcaRows.length,
-    requiredObservations: REQUIRED_OBSERVATIONS,
-    usableSensorCount: sensors.length,
-    sensorsUsed: sensors,
-    sensorsSkipped: allSensorKeys.filter((key) => !sensors.includes(key)),
-    zeroVarianceSensors,
-    bucketSizeLabel: alignedData.bucketSizeLabel,
-    failureReason: null,
-  };
   const standardizedRows = pcaRows.map((row) =>
     validColumnIndexes.map((columnIndex) => {
       const value = row.values[candidateSensors[columnIndex]];
-      // Mean-fill happens only after usable sensors are selected; this keeps
-      // sparse bucketed robot telemetry usable while preserving column means.
       const filledValue = typeof value === "number" ? value : means[columnIndex];
       return (filledValue - means[columnIndex]) / standardDeviations[columnIndex];
     }),
@@ -1015,15 +930,9 @@ function calculatePcaAnalysis(
 
   const decomposition = jacobiEigenDecomposition(covarianceMatrix);
   if (!decomposition) {
-    const failedDiagnostics = {
-      ...diagnostics,
-      failureReason: "Eigenvalue calculation failed for the covariance matrix.",
-    };
-
     return {
       status: "failed",
-      message: createPcaDiagnosticMessage(failedDiagnostics),
-      diagnostics: failedDiagnostics,
+      message: "Eigenvalue calculation failed for the covariance matrix.",
     };
   }
 
@@ -1033,18 +942,12 @@ function calculatePcaAnalysis(
       eigenvector: decomposition.eigenvectors.map((row) => row[componentIndex]),
     }))
     .sort((left, right) => right.eigenvalue - left.eigenvalue);
-
   const totalEigenvalue = eigenPairs.reduce((sum, pair) => sum + pair.eigenvalue, 0);
-  if (totalEigenvalue <= 0 || !Number.isFinite(totalEigenvalue)) {
-    const failedDiagnostics = {
-      ...diagnostics,
-      failureReason: "PCA variance was zero or invalid after covariance calculation.",
-    };
 
+  if (totalEigenvalue <= 0 || !Number.isFinite(totalEigenvalue)) {
     return {
       status: "failed",
-      message: createPcaDiagnosticMessage(failedDiagnostics),
-      diagnostics: failedDiagnostics,
+      message: "PCA variance was zero or invalid after covariance calculation.",
     };
   }
 
@@ -1059,26 +962,21 @@ function calculatePcaAnalysis(
         score: Math.abs(loading),
       }))
       .sort((left, right) => right.score - left.score);
-    const loadings = pair.eigenvector.map((loading, sensorIndex) => ({
-      sensor: sensors[sensorIndex],
-      loading,
-    }));
     const strongestLoading = contributorScores[0]?.score ?? 0;
-    const dominantContributors = contributorScores
+    const topContributors = contributorScores
       .filter((item) => strongestLoading > 0 && item.score >= strongestLoading * 0.8)
       .map((item) => item.sensor);
-    const topContributors =
-      dominantContributors.length > 0
-        ? dominantContributors
-        : contributorScores.slice(0, 1).map((item) => item.sensor);
 
     return {
       name: `PC${index + 1}`,
       explainedVariance,
       cumulativeVariance,
-      topContributors,
+      topContributors: topContributors.length > 0 ? topContributors : contributorScores.slice(0, 1).map((item) => item.sensor),
       contributorScores,
-      loadings,
+      loadings: pair.eigenvector.map((loading, sensorIndex) => ({
+        sensor: sensors[sensorIndex],
+        loading,
+      })),
     };
   });
   const pc1Vector = eigenPairs[0]?.eigenvector ?? [];
@@ -1096,7 +994,6 @@ function calculatePcaAnalysis(
     sensors,
     components,
     pcaScores,
-    diagnostics,
   };
 }
 
@@ -1145,7 +1042,6 @@ export default function Home() {
   const [anomalySeverityFilter, setAnomalySeverityFilter] = useState<AnomalySeverityFilter>("All");
   const [hoveredHeatmapCell, setHoveredHeatmapCell] = useState<HeatmapHoverInfo | null>(null);
   const [heatmapViewMode, setHeatmapViewMode] = useState<HeatmapViewMode>("grid");
-  const [showPcaAnalysis, setShowPcaAnalysis] = useState(false);
   const [showPcaBiplot, setShowPcaBiplot] = useState(false);
   const [showCorrelationHeatmap, setShowCorrelationHeatmap] = useState(false);
   const [selectedOverlaySensors, setSelectedOverlaySensors] = useState<ComparisonSensorKey[]>([]);
@@ -2313,25 +2209,6 @@ export default function Home() {
   const selectedTimeWindowLabel =
     timeUnit === "all" ? "All available data" : `${timeAmount || "-"} ${timeUnit}`;
 
-  const formatPcaSensorList = (sensorKeys: ComparisonSensorKey[]) =>
-    sensorKeys.length > 0
-      ? sensorKeys.map((sensorKey) => correlationSensorLabelByKey[sensorKey]).join(", ")
-      : "None";
-
-  const formatPcaSentenceList = (sensorKeys: ComparisonSensorKey[]) => {
-    const labels = sensorKeys.map((sensorKey) => correlationSensorLabelByKey[sensorKey]);
-    if (labels.length === 0) return "available sensors";
-    if (labels.length === 1) return labels[0];
-    return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
-  };
-
-  const pcaInterpretation =
-    pcaAnalysis.status === "ok"
-      ? `Most system variability is explained by ${formatPcaSentenceList(
-          pcaAnalysis.components[0]?.topContributors.slice(0, 2) ?? [],
-        )}.`
-      : null;
-
   const pcaBiplotData = useMemo(() => {
     if (pcaAnalysis.status !== "ok" || pcaAnalysis.components.length < 2) return null;
 
@@ -2364,18 +2241,38 @@ export default function Home() {
         angle: Math.atan2(-y, x) * (180 / Math.PI),
       };
     });
+    const xValues = [
+      ...pcaAnalysis.pcaScores.map((score) => score.pc1),
+      ...vectors.map((vector) => vector.pc1),
+    ];
+    const yValues = [
+      ...pcaAnalysis.pcaScores.map((score) => score.pc2),
+      ...vectors.map((vector) => vector.pc2),
+    ];
+    const xPadding = Math.max((Math.max(...xValues) - Math.min(...xValues)) * 0.12, 0.75);
+    const yPadding = Math.max((Math.max(...yValues) - Math.min(...yValues)) * 0.12, 0.75);
+    const xDomain: [number, number] = [
+      Math.floor(Math.min(...xValues) - xPadding),
+      Math.ceil(Math.max(...xValues) + xPadding),
+    ];
+    const yDomain: [number, number] = [
+      Math.floor(Math.min(...yValues) - yPadding),
+      Math.ceil(Math.max(...yValues) + yPadding),
+    ];
     const chartExtent = Math.max(
-      ...pcaAnalysis.pcaScores.flatMap((score) => [Math.abs(score.pc1), Math.abs(score.pc2)]),
-      ...vectors.flatMap((vector) => [Math.abs(vector.pc1), Math.abs(vector.pc2)]),
+      Math.abs(xDomain[0]),
+      Math.abs(xDomain[1]),
+      Math.abs(yDomain[0]),
+      Math.abs(yDomain[1]),
       1,
-    ) * 1.18;
+    );
     const labelOffset = chartExtent * 0.07;
     const collisionOffset = chartExtent * 0.075;
     const minimumLabelDistance = chartExtent * 0.16;
     const similarAngleThreshold = (12 * Math.PI) / 180;
     const labelPadding = chartExtent * 0.05;
-    const clampToChart = (value: number) =>
-      Math.max(-chartExtent + labelPadding, Math.min(chartExtent - labelPadding, value));
+    const clampToChart = (value: number, domain: [number, number]) =>
+      Math.max(domain[0] + labelPadding, Math.min(domain[1] - labelPadding, value));
     const angleDistance = (left: number, right: number) => {
       const difference = Math.abs(left - right) % (2 * Math.PI);
       return difference > Math.PI ? 2 * Math.PI - difference : difference;
@@ -2407,11 +2304,11 @@ export default function Home() {
         labelPc2 += perpendicularY * collisionOffset * collisionIndex * side;
       }
 
-      labelPc1 = clampToChart(labelPc1);
-      labelPc2 = clampToChart(labelPc2);
+      labelPc1 = clampToChart(labelPc1, xDomain);
+      labelPc2 = clampToChart(labelPc2, yDomain);
       placedLabels.push({ pc1: labelPc1, pc2: labelPc2, angle });
 
-      const anchor =
+      const textAnchor =
         Math.abs(normalizedX) < 0.25
           ? "middle"
           : normalizedX > 0
@@ -2424,7 +2321,7 @@ export default function Home() {
         pc2: labelPc2,
         endpointPc1: vector.pc1,
         endpointPc2: vector.pc2,
-        textAnchor: anchor,
+        textAnchor,
         showConnector: Math.hypot(labelPc1 - vector.pc1, labelPc2 - vector.pc2) > labelOffset * 1.35,
       };
     });
@@ -2433,7 +2330,8 @@ export default function Home() {
       scores: pcaAnalysis.pcaScores,
       vectors,
       labelPoints,
-      chartExtent,
+      xDomain,
+      yDomain,
       pc1Variance: pc1.explainedVariance,
       pc2Variance: pc2.explainedVariance,
     };
@@ -2461,10 +2359,22 @@ export default function Home() {
         <p className="font-semibold text-[#0F172A]">
           {new Date(point.bucketStartMs).toLocaleString()} - {new Date(point.bucketEndMs).toLocaleString()}
         </p>
-        <p className="mt-1 text-[#475569]">PC1 score: {point.pc1.toFixed(3)}</p>
-        <p className="text-[#475569]">PC2 score: {point.pc2.toFixed(3)}</p>
+        <p className="mt-1 text-[#475569]">PC1 score: {point.pc1.toFixed(2)}</p>
+        <p className="text-[#475569]">PC2 score: {point.pc2.toFixed(2)}</p>
       </div>
     );
+  };
+
+  const formatPcaAxisTick = (value: number | string) => {
+    const numericValue = Number(value);
+    return Number.isFinite(numericValue) ? numericValue.toFixed(1) : String(value);
+  };
+
+  const renderPcaObservationPoint = (props: unknown) => {
+    const { cx, cy } = props as { cx?: number; cy?: number };
+    if (typeof cx !== "number" || typeof cy !== "number") return null;
+
+    return <circle cx={cx} cy={cy} r={3} fill="#1F4E8C" opacity={0.55} />;
   };
 
   const renderPcaVectorArrow = (props: unknown) => {
@@ -2851,6 +2761,175 @@ export default function Home() {
         </section>
 
         <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="max-w-3xl">
+              <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">
+                PCA Biplot
+              </p>
+              <p className="mt-2 text-sm text-[#475569]">
+                Observation projection and sensor loading directions
+              </p>
+              <p className="mt-3 text-sm leading-6 text-[#475569]">
+                The PCA biplot shows robot operating states as points and sensor contributions as vectors.
+                Points that are close together represent similar telemetry behavior. Sensor arrows show
+                which variables most influence the principal components.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowPcaBiplot((previous) => !previous)}
+              className={`inline-flex shrink-0 items-center justify-center rounded-lg border px-4 py-2 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-blue-100 focus:ring-offset-2 ${
+                showPcaBiplot
+                  ? "border-[#1F4E8C] bg-[#1F4E8C] text-white hover:bg-[#173B69]"
+                  : "border-[#1F4E8C] bg-white text-[#1F4E8C] hover:bg-[#EFF6FF]"
+              }`}
+              aria-expanded={showPcaBiplot}
+            >
+              {showPcaBiplot ? "Hide PCA Biplot" : "Show PCA Biplot"}
+            </button>
+          </div>
+
+          <div
+            className={`overflow-hidden transition-all duration-300 ease-in-out ${
+              showPcaBiplot ? "mt-5 max-h-[920px] opacity-100" : "mt-0 max-h-0 opacity-0"
+            }`}
+          >
+            {pcaAnalysis.status !== "ok" ? (
+              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+                {pcaAnalysis.message}
+              </div>
+            ) : pcaAnalysis.components.length < 2 ? (
+              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+                PCA biplot requires PC1 and PC2.
+              </div>
+            ) : pcaAnalysis.pcaScores.length < 3 ? (
+              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+                Not enough observations to draw PCA biplot.
+              </div>
+            ) : pcaBiplotData ? (
+              <div className="space-y-4">
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] p-4">
+                  <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-[#0F172A]">
+                        PCA Biplot: Robot States and Sensor Loadings
+                      </p>
+                      <p className="text-xs text-[#475569]">
+                        Scores are projected observations; vectors are signed sensor loadings.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="h-[360px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <ScatterChart margin={{ top: 20, right: 30, bottom: 25, left: 45 }}>
+                        <CartesianGrid stroke="#E2E8F0" strokeDasharray="3 3" />
+                        <XAxis
+                          type="number"
+                          dataKey="pc1"
+                          domain={pcaBiplotData.xDomain}
+                          tickFormatter={formatPcaAxisTick}
+                          tick={{ fill: "#475569", fontSize: 12 }}
+                          tickLine={{ stroke: "#CBD5E1" }}
+                          axisLine={{ stroke: "#CBD5E1" }}
+                          label={{
+                            value: `PC1 Score (${(pcaBiplotData.pc1Variance * 100).toFixed(1)}% variance)`,
+                            position: "insideBottom",
+                            offset: -24,
+                            fill: "#475569",
+                            fontSize: 12,
+                            fontWeight: 600,
+                          }}
+                        />
+                        <YAxis
+                          type="number"
+                          dataKey="pc2"
+                          domain={pcaBiplotData.yDomain}
+                          tickFormatter={formatPcaAxisTick}
+                          tick={{ fill: "#475569", fontSize: 12 }}
+                          tickLine={{ stroke: "#CBD5E1" }}
+                          axisLine={{ stroke: "#CBD5E1" }}
+                          label={{
+                            value: `PC2 Score (${(pcaBiplotData.pc2Variance * 100).toFixed(1)}% variance)`,
+                            angle: -90,
+                            position: "insideLeft",
+                            fill: "#475569",
+                            fontSize: 12,
+                            fontWeight: 600,
+                          }}
+                        />
+                        <Tooltip content={renderPcaScoreTooltip} cursor={{ stroke: "#94A3B8", strokeDasharray: "3 3" }} />
+                        <ReferenceLine x={0} stroke="#94A3B8" strokeDasharray="4 4" />
+                        <ReferenceLine y={0} stroke="#94A3B8" strokeDasharray="4 4" />
+                        <Scatter
+                          name="Robot states"
+                          data={pcaBiplotData.scores}
+                          shape={renderPcaObservationPoint}
+                          isAnimationActive={false}
+                        />
+                        {pcaBiplotData.vectors.map((vector) => (
+                          <Scatter
+                            key={`pca-vector-line-${vector.sensor}`}
+                            data={[
+                              { pc1: 0, pc2: 0 },
+                              { pc1: vector.pc1, pc2: vector.pc2 },
+                            ]}
+                            line={{ stroke: vector.color, strokeWidth: 2 }}
+                            shape={() => null}
+                            isAnimationActive={false}
+                          />
+                        ))}
+                        <Scatter
+                          name="Sensor loadings"
+                          data={pcaBiplotData.vectors}
+                          shape={renderPcaVectorArrow}
+                          isAnimationActive={false}
+                        />
+                        {pcaBiplotData.labelPoints
+                          .filter((labelPoint) => labelPoint.showConnector)
+                          .map((labelPoint) => (
+                            <Scatter
+                              key={`pca-label-connector-${labelPoint.sensor}`}
+                              data={[
+                                { pc1: labelPoint.endpointPc1, pc2: labelPoint.endpointPc2 },
+                                { pc1: labelPoint.pc1, pc2: labelPoint.pc2 },
+                              ]}
+                              line={{ stroke: "#94A3B8", strokeWidth: 1, strokeDasharray: "3 3" }}
+                              shape={() => null}
+                              isAnimationActive={false}
+                            />
+                          ))}
+                        <Scatter
+                          name="Sensor labels"
+                          data={pcaBiplotData.labelPoints}
+                          shape={renderPcaVectorLabel}
+                          isAnimationActive={false}
+                        />
+                      </ScatterChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3 text-sm text-[#475569]">
+                  <p className="font-semibold text-[#0F172A]">How to read this graph:</p>
+                  <ul className="mt-2 grid gap-1 sm:grid-cols-2">
+                    <li>Points close together represent similar robot states.</li>
+                    <li>Points far apart represent different behavior or possible anomalies.</li>
+                    <li>Longer arrows mean stronger sensor contribution.</li>
+                    <li>Sensors pointing in the same direction are positively related.</li>
+                    <li>Sensors pointing in opposite directions are negatively related.</li>
+                    <li>Sensors near 90 degrees apart have weak relationship.</li>
+                  </ul>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
+                PCA biplot requires PC1 and PC2.
+              </div>
+            )}
+          </div>
+        </section>
+
+        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
           <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">Sensor Overview</p>
           <div className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
             {metricCards.map((card) => {
@@ -3179,334 +3258,6 @@ export default function Home() {
                 </tbody>
               </table>
             </div>
-          </div>
-        </section>
-
-        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
-          <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
-            <div className="max-w-3xl">
-              <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">
-                PCA Analysis
-              </p>
-              <p className="mt-2 text-sm text-[#475569]">
-                Dimensionality reduction of current sensor window
-              </p>
-              <p className="mt-3 text-sm leading-6 text-[#475569]">
-                PCA reduces multiple sensor variables into principal components that capture the
-                dominant behavior of the robot.
-              </p>
-            </div>
-            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2 text-xs text-[#475569] lg:max-w-xs">
-              Based on PCA lecture: standardization {">"} covariance matrix {">"} eigenvalues/eigenvectors {">"} explained variance.
-            </div>
-            <button
-              type="button"
-              onClick={() => setShowPcaAnalysis((previous) => !previous)}
-              className={`inline-flex shrink-0 items-center justify-center rounded-lg border px-4 py-2 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-blue-100 focus:ring-offset-2 ${
-                showPcaAnalysis
-                  ? "border-[#1F4E8C] bg-[#1F4E8C] text-white hover:bg-[#173B69]"
-                  : "border-[#1F4E8C] bg-white text-[#1F4E8C] hover:bg-[#EFF6FF]"
-              }`}
-              aria-expanded={showPcaAnalysis}
-            >
-              {showPcaAnalysis ? "Hide PCA Analysis" : "Show PCA Analysis"}
-            </button>
-          </div>
-
-          <div
-            className={`overflow-hidden transition-all duration-300 ease-in-out ${
-              showPcaAnalysis ? "mt-5 max-h-[980px] opacity-100" : "mt-0 max-h-0 opacity-0"
-            }`}
-          >
-            <div className="grid gap-3 text-xs sm:grid-cols-2 xl:grid-cols-4">
-            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
-              <p className="uppercase tracking-wide text-[#475569]">Aligned observations</p>
-              <p className="mt-1 font-semibold text-[#0F172A]">
-                {pcaAnalysis.diagnostics.alignedObservations}
-              </p>
-            </div>
-            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
-              <p className="uppercase tracking-wide text-[#475569]">Observations used</p>
-              <p className="mt-1 font-semibold text-[#0F172A]">
-                {pcaAnalysis.diagnostics.observationsUsed}
-              </p>
-            </div>
-            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
-              <p className="uppercase tracking-wide text-[#475569]">Bucket size</p>
-              <p className="mt-1 font-semibold text-[#0F172A]">
-                {pcaAnalysis.diagnostics.bucketSizeLabel}
-              </p>
-            </div>
-            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
-              <p className="uppercase tracking-wide text-[#475569]">Sensors used</p>
-              <p className="mt-1 font-semibold text-[#0F172A]">
-                {formatPcaSensorList(pcaAnalysis.diagnostics.sensorsUsed)}
-              </p>
-            </div>
-          </div>
-
-            <div className="mt-3 grid gap-3 text-xs sm:grid-cols-2">
-            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
-              <p className="uppercase tracking-wide text-[#475569]">Sensors skipped</p>
-              <p className="mt-1 font-semibold text-[#0F172A]">
-                {formatPcaSensorList(pcaAnalysis.diagnostics.sensorsSkipped)}
-              </p>
-            </div>
-            <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-3 py-2">
-              <p className="uppercase tracking-wide text-[#475569]">Time window used</p>
-              <p className="mt-1 font-semibold text-[#0F172A]">{selectedTimeWindowLabel}</p>
-            </div>
-          </div>
-
-            {pcaAnalysis.status === "ok" ? (
-            <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1.1fr]">
-              <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-1">
-                {pcaAnalysis.components.slice(0, 2).map((component, index) => {
-                  const percent = component.explainedVariance * 100;
-
-                  return (
-                    <div key={component.name} className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
-                      <p className="text-[12px] font-semibold uppercase tracking-wide text-[#475569]">
-                        Principal Component {index + 1}
-                      </p>
-                      <div className="mt-3 h-2.5 overflow-hidden rounded-full bg-[#E2E8F0]">
-                        <div
-                          className="h-full rounded-full bg-[#1F4E8C]"
-                          style={{ width: `${Math.max(0, Math.min(100, percent))}%` }}
-                        />
-                      </div>
-                      <p className="mt-2 text-lg font-semibold text-[#0F172A]">
-                        {percent.toFixed(1)}%
-                      </p>
-                    </div>
-                  );
-                })}
-                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3">
-                  <p className="text-[11px] uppercase tracking-wide text-[#475569]">Cumulative</p>
-                  <p className="mt-1 text-sm font-semibold text-[#0F172A]">
-                    PC1 + PC2 capture {(pcaAnalysis.components[1]?.cumulativeVariance ?? pcaAnalysis.components[0]?.cumulativeVariance ?? 0).toLocaleString(undefined, {
-                      maximumFractionDigits: 1,
-                      style: "percent",
-                    })}{" "}
-                    of system behavior
-                  </p>
-                </div>
-              </div>
-
-              <div className="overflow-hidden rounded-lg border border-[#D8E0EA]">
-                <table className="min-w-full divide-y divide-[#D8E0EA] text-left text-sm">
-                  <thead className="bg-[#F8FAFC]">
-                    <tr>
-                      <th className="px-4 py-3 font-semibold text-[#475569]" scope="col">
-                        Component
-                      </th>
-                      <th className="px-4 py-3 font-semibold text-[#475569]" scope="col">
-                        Dominant Contributors
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[#E2E8F0] bg-white">
-                    {pcaAnalysis.components.slice(0, 2).map((component) => (
-                      <tr key={component.name}>
-                        <td className="px-4 py-4 font-mono font-semibold text-[#0F172A]">
-                          {component.name}
-                        </td>
-                        <td className="px-4 py-4 text-[#475569]">
-                          <div className="flex flex-wrap gap-2">
-                            {component.topContributors.map((sensorKey) => (
-                              <span
-                                key={`${component.name}-${sensorKey}`}
-                                className="rounded-full border border-[#D8E0EA] bg-[#F8FAFC] px-2.5 py-1 text-xs font-medium text-[#475569]"
-                              >
-                                {correlationSensorLabelByKey[sensorKey]}
-                              </span>
-                            ))}
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                {pcaInterpretation && (
-                  <p className="border-t border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3 text-sm font-medium text-[#475569]">
-                    {pcaInterpretation}
-                  </p>
-                )}
-              </div>
-            </div>
-            ) : (
-            <div className="mt-5 rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
-              {pcaAnalysis.message}
-            </div>
-            )}
-          </div>
-        </section>
-
-        <section className="rounded-lg border border-[#D8E0EA] bg-white p-6">
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-            <div className="max-w-3xl">
-              <p className="text-[15px] font-semibold uppercase tracking-wide text-[#1F4E8C]">
-                PCA Biplot
-              </p>
-              <p className="mt-2 text-sm text-[#475569]">
-                Observation projection and sensor loading directions
-              </p>
-              <p className="mt-3 text-sm leading-6 text-[#475569]">
-                The PCA biplot shows robot operating states as points and sensor contributions as vectors.
-                Points that are close together represent similar telemetry behavior. Sensor arrows show
-                which variables most influence the principal components.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => setShowPcaBiplot((previous) => !previous)}
-              className={`inline-flex shrink-0 items-center justify-center rounded-lg border px-4 py-2 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-blue-100 focus:ring-offset-2 ${
-                showPcaBiplot
-                  ? "border-[#1F4E8C] bg-[#1F4E8C] text-white hover:bg-[#173B69]"
-                  : "border-[#1F4E8C] bg-white text-[#1F4E8C] hover:bg-[#EFF6FF]"
-              }`}
-              aria-expanded={showPcaBiplot}
-            >
-              {showPcaBiplot ? "Hide PCA Biplot" : "Show PCA Biplot"}
-            </button>
-          </div>
-
-          <div
-            className={`overflow-hidden transition-all duration-300 ease-in-out ${
-              showPcaBiplot ? "mt-5 max-h-[920px] opacity-100" : "mt-0 max-h-0 opacity-0"
-            }`}
-          >
-            {pcaAnalysis.status !== "ok" ? (
-              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
-                {pcaAnalysis.message}
-              </div>
-            ) : pcaAnalysis.components.length < 2 ? (
-              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
-                PCA biplot requires PC1 and PC2.
-              </div>
-            ) : pcaAnalysis.pcaScores.length < 3 ? (
-              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
-                Not enough observations to draw PCA biplot.
-              </div>
-            ) : pcaBiplotData ? (
-              <div className="space-y-4">
-                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] p-4">
-                  <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
-                    <div>
-                      <p className="text-sm font-semibold text-[#0F172A]">
-                        PCA Biplot: Robot States and Sensor Loadings
-                      </p>
-                      <p className="text-xs text-[#475569]">
-                        Scores are projected observations; vectors are signed sensor loadings.
-                      </p>
-                    </div>
-                  </div>
-                  <div className="h-[360px] w-full">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <ScatterChart margin={{ top: 18, right: 28, bottom: 34, left: 12 }}>
-                        <CartesianGrid stroke="#E2E8F0" strokeDasharray="3 3" />
-                        <XAxis
-                          type="number"
-                          dataKey="pc1"
-                          domain={[-pcaBiplotData.chartExtent, pcaBiplotData.chartExtent]}
-                          tick={{ fill: "#475569", fontSize: 12 }}
-                          tickLine={{ stroke: "#CBD5E1" }}
-                          axisLine={{ stroke: "#CBD5E1" }}
-                          label={{
-                            value: `PC1 Score (${(pcaBiplotData.pc1Variance * 100).toFixed(1)}% variance)`,
-                            position: "insideBottom",
-                            offset: -24,
-                            fill: "#475569",
-                            fontSize: 12,
-                            fontWeight: 600,
-                          }}
-                        />
-                        <YAxis
-                          type="number"
-                          dataKey="pc2"
-                          domain={[-pcaBiplotData.chartExtent, pcaBiplotData.chartExtent]}
-                          tick={{ fill: "#475569", fontSize: 12 }}
-                          tickLine={{ stroke: "#CBD5E1" }}
-                          axisLine={{ stroke: "#CBD5E1" }}
-                          label={{
-                            value: `PC2 Score (${(pcaBiplotData.pc2Variance * 100).toFixed(1)}% variance)`,
-                            angle: -90,
-                            position: "insideLeft",
-                            fill: "#475569",
-                            fontSize: 12,
-                            fontWeight: 600,
-                          }}
-                        />
-                        <Tooltip content={renderPcaScoreTooltip} cursor={{ stroke: "#94A3B8", strokeDasharray: "3 3" }} />
-                        <ReferenceLine x={0} stroke="#94A3B8" strokeDasharray="4 4" />
-                        <ReferenceLine y={0} stroke="#94A3B8" strokeDasharray="4 4" />
-                        <Scatter
-                          name="Robot states"
-                          data={pcaBiplotData.scores}
-                          fill="#1F4E8C"
-                          fillOpacity={0.62}
-                          isAnimationActive={false}
-                        />
-                        {pcaBiplotData.vectors.map((vector) => (
-                          <Scatter
-                            key={`pca-vector-line-${vector.sensor}`}
-                            data={[
-                              { pc1: 0, pc2: 0 },
-                              { pc1: vector.pc1, pc2: vector.pc2 },
-                            ]}
-                            line={{ stroke: vector.color, strokeWidth: 2 }}
-                            shape={() => null}
-                            isAnimationActive={false}
-                          />
-                        ))}
-                        <Scatter
-                          name="Sensor loadings"
-                          data={pcaBiplotData.vectors}
-                          shape={renderPcaVectorArrow}
-                          isAnimationActive={false}
-                        />
-                        {pcaBiplotData.labelPoints
-                          .filter((labelPoint) => labelPoint.showConnector)
-                          .map((labelPoint) => (
-                            <Scatter
-                              key={`pca-label-connector-${labelPoint.sensor}`}
-                              data={[
-                                { pc1: labelPoint.endpointPc1, pc2: labelPoint.endpointPc2 },
-                                { pc1: labelPoint.pc1, pc2: labelPoint.pc2 },
-                              ]}
-                              line={{ stroke: "#94A3B8", strokeWidth: 1, strokeDasharray: "3 3" }}
-                              shape={() => null}
-                              isAnimationActive={false}
-                            />
-                          ))}
-                        <Scatter
-                          name="Sensor labels"
-                          data={pcaBiplotData.labelPoints}
-                          shape={renderPcaVectorLabel}
-                          isAnimationActive={false}
-                        />
-                      </ScatterChart>
-                    </ResponsiveContainer>
-                  </div>
-                </div>
-
-                <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-3 text-sm text-[#475569]">
-                  <p className="font-semibold text-[#0F172A]">How to read this graph:</p>
-                  <ul className="mt-2 grid gap-1 sm:grid-cols-2">
-                    <li>Points close together represent similar robot states.</li>
-                    <li>Points far apart represent different behavior or possible anomalies.</li>
-                    <li>Longer arrows mean stronger sensor contribution.</li>
-                    <li>Sensors pointing in the same direction are positively related.</li>
-                    <li>Sensors pointing in opposite directions are negatively related.</li>
-                    <li>Sensors near 90 degrees apart have weak relationship.</li>
-                  </ul>
-                </div>
-              </div>
-            ) : (
-              <div className="rounded-lg border border-[#D8E0EA] bg-[#F8FAFC] px-4 py-4 text-sm font-medium text-[#475569]">
-                PCA biplot requires PC1 and PC2.
-              </div>
-            )}
           </div>
         </section>
 
